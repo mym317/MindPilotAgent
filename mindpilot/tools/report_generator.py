@@ -213,13 +213,32 @@ class ReportGenerator:
         if ev:
             _add_heading("质量评估", 1)
             score = ev.get("overall_score", "N/A")
-            _add_body(f"综合评分：{score}　|　"
+            _add_body(f"最终可交付评分：{score}　|　"
                       f"准确性：{ev.get('accuracy','N/A')}　|　"
                       f"完整性：{ev.get('completeness','N/A')}　|　"
                       f"格式规范：{ev.get('format_quality','N/A')}")
-            fb = ev.get("feedback", "")
-            if fb:
-                _add_body(f"评审意见：{fb}")
+            if "llm_expert_score" in ev or "rule_consistency_score" in ev:
+                _add_body(
+                    f"LLM 专家评审分：{ev.get('llm_expert_score', 'N/A')}　|　"
+                    f"规则一致性评分：{ev.get('rule_consistency_score', score)}"
+                )
+            rule_dimension_scores = ev.get("rule_dimension_scores", {}) or {}
+            if rule_dimension_scores:
+                detail = "；".join(f"{key}: {value}" for key, value in rule_dimension_scores.items())
+                _add_body(f"规则评分维度：{detail}")
+            review_summary = ev.get("review_summary", {}) or {}
+            overall_review = review_summary.get("overall") or ev.get("feedback", "")
+            if overall_review:
+                _add_body("综合评审意见：", bold=True)
+                _add_body(overall_review)
+            role_reviews = review_summary.get("role_reviews") or ev.get("role_reviews", [])
+            if role_reviews:
+                _add_body("各评审角色简要意见：", bold=True)
+                for review in role_reviews:
+                    reviewer = review.get("reviewer", "评审角色")
+                    role_score = review.get("overall_score", "N/A")
+                    brief = review.get("brief", "未提供详细意见")
+                    _add_body(f"{reviewer}（{role_score}）：{brief}", indent=True)
 
         doc.save(str(path))
 
@@ -315,14 +334,39 @@ class ReportGenerator:
                 "",
                 f"| 维度 | 得分 |",
                 f"|------|------|",
-                f"| 综合评分 | {score} |",
+                f"| 最终可交付评分 | {score} |",
+                f"| LLM 专家评审分 | {ev.get('llm_expert_score','N/A')} |",
+                f"| 规则一致性评分 | {ev.get('rule_consistency_score', score)} |",
                 f"| 准确性   | {ev.get('accuracy','N/A')} |",
                 f"| 完整性   | {ev.get('completeness','N/A')} |",
                 f"| 格式规范 | {ev.get('format_quality','N/A')} |",
                 "",
-                f"> {ev.get('feedback','')}",
-                "",
             ]
+            rule_dimension_scores = ev.get("rule_dimension_scores", {}) or {}
+            if rule_dimension_scores:
+                lines += ["### 规则评分维度", ""]
+                lines += ["| 规则维度 | 得分 |", "|------|------|"]
+                for key, value in rule_dimension_scores.items():
+                    lines.append(f"| {key} | {value} |")
+                lines.append("")
+            review_summary = ev.get("review_summary", {}) or {}
+            overall_review = review_summary.get("overall") or ev.get("feedback", "")
+            if overall_review:
+                lines += [
+                    "### 综合评审意见",
+                    "",
+                    overall_review,
+                    "",
+                ]
+            role_reviews = review_summary.get("role_reviews") or ev.get("role_reviews", [])
+            if role_reviews:
+                lines += ["### 各评审角色简要意见", ""]
+                for review in role_reviews:
+                    reviewer = review.get("reviewer", "评审角色")
+                    role_score = review.get("overall_score", "N/A")
+                    brief = review.get("brief", "未提供详细意见")
+                    lines.append(f"- **{reviewer}**（{role_score}）：{brief}")
+                lines.append("")
 
         return "\n".join(lines)
 
