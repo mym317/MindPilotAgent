@@ -213,6 +213,13 @@ class MindPilotOrchestrator:
             t = next((t for t in plan.tasks if t.agent == agent_name), None)
             return t.description if t else default
 
+        def _experiment_task_desc(default: str) -> str:
+            for t in plan.tasks:
+                text = f"{t.name} {t.description}"
+                if t.agent == "EvaluationAgent" and "实验" in text:
+                    return t.description or default
+            return _task_desc("EvaluationAgent", default)
+
         # ── Step 2: 文献检索 ──────────────────────────────────
         # 文献检索先行完成，其输出结果（论文列表、综述、知识图谱）将直接
         # 传递给 Step 3 实验设计，使实验设计能够参考领域现有工作，从而
@@ -249,9 +256,17 @@ class MindPilotOrchestrator:
             "full_description": "实验设计未完成，请根据文献结果手动补充",
             "_fallback": True,
         }
+        exp_task_desc = _experiment_task_desc(
+            f"基于文献结果为「{query}」设计实验假设、数据集、基线方法、评估指标和可复现流程"
+        )
         exp_design = self._run_step(
             "experiment",
-            lambda: self.eval_agent.design_experiment(query, lit_result, research_path=plan.selected_path),
+            lambda: self.eval_agent.design_experiment(
+                query,
+                lit_result,
+                research_path=plan.selected_path,
+                task_description=exp_task_desc,
+            ),
             exp_fallback,
         )
 

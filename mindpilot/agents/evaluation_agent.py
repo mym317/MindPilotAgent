@@ -587,6 +587,7 @@ class EvaluationAgent:
     # ── 实验设计（EvaluationAgent 内部生成）───────────────────
     def design_experiment(self, query: str, literature_result: dict,
                           research_path: str = "",
+                          task_description: str = "",
                           upstream_design: Optional[dict] = None) -> dict:
         """
         基于文献综述和推荐研究路径生成完整实验设计方案。
@@ -662,6 +663,7 @@ sections 要求：
 - 不要生成 Markdown 代码块，不要在 JSON 外输出解释文字。"""
 
             path_part = f"推荐研究路径：\n{research_path}\n\n" if research_path else ""
+            task_part = f"规划任务描述：\n{task_description}\n\n" if task_description else ""
             prompt = (
                 "请返回完整 JSON，禁止 Markdown 代码块，禁止在 JSON 外输出解释文字。"
                 "数组字段建议 3-5 项，sections 生成 5-6 个带 3.x 编号、可直接放入论文的二级小节。\n\n"
@@ -670,6 +672,7 @@ sections 要求：
                 "其中 objectives、metrics、baselines、procedure、ablations 必须为数组，variables 必须为对象。\n\n"
                 f"研究问题：{query}\n\n"
                 f"{path_part}"
+                f"{task_part}"
                 f"相关文献方法参考：\n{methods_ref or '暂无可用文献方法摘要，请基于研究问题设计可复现实验。'}\n\n"
                 "请设计完整实验方案，重点保证实验流程完整、可复现性明确，且 sections 与结构化字段相互一致："
             )
@@ -691,6 +694,7 @@ sections 要求：
             if not result.get("full_description"):
                 result["full_description"] = self._summarize_experiment_design_from_fields(result)
             result["_source"] = "evaluation_agent_generated"
+            result["task_description"] = task_description
             result["structured_summary"] = self._format_experiment_design(result)
             self.logger.finish_call(call, result)
             self.logger.success(self.AGENT_NAME, "实验设计方案生成完成")
@@ -1497,14 +1501,12 @@ sections 要求：
         experiment_text = self._experiment_sections_text(report_content)
         experiment_consistency = 0.85 if exp_design else 0.55
         experiment_checks = [
-            ("3.1", exp_design.get("research_hypothesis", ""), "research hypothesis"),
-            ("3.x", exp_design.get("metrics", []), "metrics"),
-            ("3.x", exp_design.get("baselines", []), "baselines"),
+            (exp_design.get("research_hypothesis", ""), "research hypothesis"),
+            (exp_design.get("metrics", []), "metrics"),
+            (exp_design.get("baselines", []), "baselines"),
         ]
-        for prefix, expected, label in experiment_checks:
-            body = self._section_body(report_content, prefix)
-            if prefix == "3.x":
-                body = experiment_text
+        for expected, label in experiment_checks:
+            body = experiment_text
             expected_items = self._list_values(expected)
             if expected_items:
                 matched = sum(1 for item in expected_items if self._experiment_item_matches_body(item, body))
