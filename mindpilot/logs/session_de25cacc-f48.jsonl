@@ -1,2 +1,0 @@
-{"ts": "2026-04-11T16:32:56.223492", "session": "de25cacc-f48", "level": "INFO", "agent": "Memory", "message": "向量嵌入模型已加载: all-MiniLM-L6-v2", "data": null}
-{"ts": "2026-04-11T16:32:56.225826", "session": "de25cacc-f48", "level": "INFO", "agent": "Memory", "message": "加载 10 条长期记忆", "data": null}

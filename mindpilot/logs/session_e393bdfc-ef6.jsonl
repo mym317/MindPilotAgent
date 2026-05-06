@@ -1,2 +1,0 @@
-{"ts": "2026-04-12T00:01:50.250865", "session": "e393bdfc-ef6", "level": "INFO", "agent": "Memory", "message": "向量嵌入模型已加载: all-MiniLM-L6-v2", "data": null}
-{"ts": "2026-04-12T00:01:50.259858", "session": "e393bdfc-ef6", "level": "INFO", "agent": "Memory", "message": "加载 26 条长期记忆", "data": null}
