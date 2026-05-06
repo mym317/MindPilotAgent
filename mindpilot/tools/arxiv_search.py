@@ -3,6 +3,7 @@ ArXiv 文献检索工具
 ==================
 对接 ArXiv API，实现关键词检索与元数据提取。
 已升级：使用 LLM 动态进行中英文学术词汇翻译。
+已升级：优化 Boolean 逻辑为 Core AND (Sub1 OR Sub2)，极大提升召回率。
 """
 
 import re
@@ -65,7 +66,6 @@ class ArXivSearchTool:
           "arxiv": "http://arxiv.org/schemas/atom"}
 
     def __init__(self, llm_client: Any, max_results: int = 10, logger=None):
-        # 注入 LLM 客户端用于翻译
         self.llm = llm_client
         self.max_results = max_results
         self.logger = logger
@@ -75,7 +75,6 @@ class ArXivSearchTool:
         if not _contains_chinese(query):
             return query, False
 
-        # 【修改点】：强制要求用英文逗号分隔不同的核心概念
         system_prompt = (
             "你是一个学术检索专家。你的任务是将用户的中文查询转换为 ArXiv 数据库所需的英文检索词组。\n"
             "严格遵守以下规则：\n"
@@ -102,12 +101,9 @@ class ArXivSearchTool:
 
     def search(self, query: str, max_results: Optional[int] = None,
                categories: Optional[list[str]] = None) -> list[Paper]:
-        """
-        搜索 ArXiv 论文
-        """
+        """搜索 ArXiv 论文"""
         n = max_results or self.max_results
 
-        # 动态调用 LLM 进行翻译
         en_query, translated = self._translate_query_with_llm(query)
         if translated and self.logger:
             self.logger.info("ArXivTool", f"LLM 智能翻译: 「{query}」→「{en_query}」")
@@ -142,13 +138,20 @@ class ArXivSearchTool:
 
     def _build_query(self, query: str, categories: Optional[list[str]]) -> str:
         """
-        将逗号分隔的查询词转换为 ArXiv 标准的 Boolean 查询格式。
+        【重点修改】：采用主从逻辑：Core AND (Sub1 OR Sub2)
         """
         terms = [t.strip() for t in query.split(',') if t.strip()]
         
         if terms:
-            q_parts = [f'all:"{term}"' for term in terms]
-            q_str = " AND ".join(q_parts)
+            # 排名第一的词是绝对核心，必须包含
+            core_term = terms[0]
+            q_str = f'all:"{core_term}"'
+            
+            # 后续的词作为拓展词，用 OR 连接，命中任意一个即可
+            if len(terms) > 1:
+                sub_terms = terms[1:]
+                sub_q = " OR ".join([f'all:"{t}"' for t in sub_terms])
+                q_str = f'({q_str} AND ({sub_q}))'
         else:
             q_str = 'all:"deep learning"'
             
@@ -156,13 +159,15 @@ class ArXivSearchTool:
             cat_q = " OR ".join(f"cat:{c}" for c in categories)
             q_str = f"({q_str}) AND ({cat_q})"
             
-        # 【修改点】：直接返回原字符串，千万不要在这里做 urllib.parse.quote!
         return q_str
 
     def _parse_xml(self, xml_data: str, query: str) -> list[Paper]:
         root = ET.fromstring(xml_data)
         papers = []
-        query_words = set(query.lower().split())
+        
+        # 兼容逗号切分后的词频统计
+        clean_query = query.replace(',', ' ').replace('"', ' ').lower()
+        query_words = set(clean_query.split())
 
         for entry in root.findall("atom:entry", self.NS):
             try:
@@ -181,7 +186,6 @@ class ArXivSearchTool:
                 url = f"https://arxiv.org/abs/{arxiv_id}"
                 pdf_url = f"https://arxiv.org/pdf/{arxiv_id}"
 
-                # 计算简单相关性分数
                 text = (title + " " + abstract).lower()
                 score = sum(1 for w in query_words if w in text) / max(len(query_words), 1)
 
@@ -203,7 +207,6 @@ class ArXivSearchTool:
         return papers
 
     def _mock_papers(self, query: str, n: int) -> list[Paper]:
-        """网络不可用时的 Mock 论文数据"""
         topics = query.split()[:3]
         mock = []
         templates = [
@@ -230,6 +233,5 @@ class ArXivSearchTool:
         return mock
 
     def get_paper_by_id(self, arxiv_id: str) -> Optional[Paper]:
-        """按 ID 获取单篇论文"""
         results = self.search(f"id:{arxiv_id}", max_results=1)
         return results[0] if results else None
