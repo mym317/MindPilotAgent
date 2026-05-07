@@ -46,7 +46,7 @@ def _extract_json_object(text: str) -> Optional[dict]:
         return None
 
 
-def _clamp_score(value: Any, default: float = 0.7) -> float:
+def _clamp_score(value: Any, default: float = 0.5) -> float:
     # Judge scores are normalized to the closed interval [0, 1].
     try:
         return max(0.0, min(1.0, float(value)))
@@ -76,16 +76,25 @@ class LLMJudge:
         prompt = (
             "返回格式：\n"
             "{"
-            '"overall_score": 0.70, '
-            '"accuracy": 0.70, '
-            '"completeness": 0.70, '
-            '"format_quality": 0.70, '
+            '"overall_score": 0.50, '
+            '"accuracy": 0.50, '
+            '"completeness": 0.50, '
+            '"format_quality": 0.50, '
             '"feedback": "具体评价", '
             '"needs_reflection": false, '
             '"reflection_suggestion": "可选的改进建议"'
             "}\n\n"
             "评分标准：accuracy=内容准确性，completeness=信息完整性，"
             "format_quality=结构与表达质量。当 overall_score 低于阈值时，needs_reflection=true。\n\n"
+            "请按以下严格区间打分，不要因为文本流畅或篇幅完整就给高分：\n"
+            "- 0.90-1.00：证据链完整，实验设计、代码执行、分析结果和结论高度一致，几乎没有明显问题。\n"
+            "- 0.75-0.89：整体质量较好，但仍有少量证据边界、实验细节或表达规范问题。\n"
+            "- 0.60-0.74：文本基本可读，但前置证据利用不足，实验设计、代码实现或结果分析存在明显弱点。\n"
+            "- 0.40-0.59：存在较严重的不一致、证据缺失、执行状态不清或结果表述过度问题，需要明显修改。\n"
+            "- 0.00-0.39：报告与前置结果严重矛盾，或把失败/缺失证据写成已验证结论，基本不可交付。\n"
+            "如果代码执行失败、文献检索为空、实验指标/基线缺失或结果没有分析证据，除非报告明确说明限制，否则 overall_score 通常不应高于 0.70。\n"
+            "如果最终结论声称显著提升、优于基线或验证成功，但前置结果没有对应证据，overall_score 通常不应高于 0.55。\n"
+            "上面的 JSON 数字只是格式示例，不代表默认分或基础分。\n\n"
             f"{rubric_part}"
             f"研究问题：{query}\n\n"
             "注意：下方可能是为节省上下文而截取的报告文本。"
@@ -156,22 +165,27 @@ class LLMJudge:
 class MultiAgentJudge:
     """Use multiple LLM judge personas and aggregate their scores."""
 
-    SEGMENT_CHAR_LIMIT = 3500
+    SEGMENT_CHAR_LIMIT = 6500
+    SUPPLEMENTAL_EVIDENCE_LIMIT = 3500
 
     DEFAULT_REVIEWERS = [
         {
             "name": "证据一致性评审专家",
-            "weight": 0.40,
+            "weight": 0.30,
             "rubric": "重点检查报告结论是否有文献、实验设计、代码执行和分析结果支撑，惩罚无依据的泛化与夸大。",
         },
         {
             "name": "实验方法评审专家",
-            "weight": 0.35,
-            "rubric": "重点检查实验假设、评估指标、基线方法、流程和结果分析是否前后一致。",
+            "weight": 0.60,
+            "rubric": (
+                "重点对照前置实验设计与 CodeAgent 输出，审核代码实现是否真正围绕实验设计中的数据集、基线方法、"
+                "评估指标、实验流程、变量控制和消融方案展开；若代码只是泛泛演示、没有实现实验设计要求，"
+                "或代码执行输出无法支撑实验设计中的关键指标，应显著扣分。"
+            ),
         },
         {
             "name": "论文写作与结构评审专家",
-            "weight": 0.25,
+            "weight": 0.10,
             "rubric": "重点检查摘要、章节结构、学术表达、格式规范和可读性。",
         },
     ]
@@ -181,15 +195,26 @@ class MultiAgentJudge:
         self.reviewers = reviewers or self.DEFAULT_REVIEWERS
         self.single_judge = LLMJudge(llm_client, threshold=threshold, logger=logger)
 
-    def score_many(self, query: str, output: str, output_type: str = "report") -> tuple[EvalScore, list[dict]]:
+    def score_many(
+        self,
+        query: str,
+        output: str,
+        output_type: str = "report",
+        supplemental_evidence: str = "",
+        reviewer_names: Optional[list[str]] = None,
+        focus_note: str = "",
+    ) -> tuple[EvalScore, list[dict]]:
         segments = self._split_report_segments(output)
+        reviewers = self._select_reviewers(reviewer_names)
         reviews = []
-        for reviewer in self.reviewers:
+        for reviewer in reviewers:
             score, segment_reviews = self._score_reviewer_segments(
                 query,
                 segments,
                 output_type,
                 reviewer,
+                supplemental_evidence=supplemental_evidence,
+                focus_note=focus_note,
             )
             reviews.append(
                 {
@@ -250,15 +275,21 @@ class MultiAgentJudge:
         segments: list[dict],
         output_type: str,
         reviewer: dict,
+        supplemental_evidence: str = "",
+        focus_note: str = "",
     ) -> tuple[EvalScore, list[dict]]:
         segment_reviews = []
         total_segments = len(segments) or 1
+        evidence_note = self._build_supplemental_evidence_note(reviewer, supplemental_evidence)
+        focus_instruction = f"\n本轮复评重点：{focus_note}" if focus_note else ""
         for idx, segment in enumerate(segments, 1):
             segment_rubric = (
                 f"{reviewer['rubric']}\n"
                 f"本次采用分段评审，这是第 {idx}/{total_segments} 段：{segment['title']}。"
                 "请只评价本段真实内容，不要因为没有看到整篇报告而惩罚完整性；"
                 "只有本段内部确实存在语义断裂时，才指出截断问题。"
+                f"{focus_instruction}"
+                f"{evidence_note}"
             )
             score = self.single_judge.score(
                 query,
@@ -306,10 +337,13 @@ class MultiAgentJudge:
         format_quality = weighted("format_quality")
         needs_reflection = overall < self.threshold or any(item["score"].needs_reflection for item in segment_reviews)
         weakest = sorted(segment_reviews, key=lambda item: item["score"].overall)[:3]
-        feedback = "；".join(
-            f"{item['title']}：{item['score'].feedback or '无详细反馈'}"
+        feedback_items = [
+            self._clean_segment_feedback(item["score"].feedback)
             for item in weakest
-        )
+        ]
+        feedback = "；".join(item for item in feedback_items if item)
+        if not feedback:
+            feedback = "本轮分段评审未返回可展示文字意见，请结合结构化评分与规则一致性发现判断。"
         suggestions = "；".join(
             item["score"].reflection_suggestion
             for item in segment_reviews
@@ -325,12 +359,29 @@ class MultiAgentJudge:
             reflection_suggestion=suggestions,
         )
 
+    def _clean_segment_feedback(self, feedback: str) -> str:
+        text = (feedback or "").strip()
+        if not text or text in {"Mock 评分", "无详细反馈"}:
+            return ""
+        if "：Mock 评分" in text:
+            text = text.replace("：Mock 评分", "")
+        prefix, sep, suffix = text.partition("：")
+        if sep and ("/" in prefix or len(prefix) > 40 or re.search(r"^\d+(\.\d+)?\s", prefix)):
+            text = suffix.strip()
+        return text
+
     def _split_report_segments(self, output: str) -> list[dict]:
         text = (output or "").strip()
         if not text:
             return [{"title": "空报告", "text": "", "chars": 0}]
 
-        blocks = self._split_report_blocks(text)
+        blocks = [
+            (title, block_text)
+            for title, block_text in self._split_report_blocks(text)
+            if self._is_reviewable_report_block(title, block_text)
+        ]
+        if not blocks:
+            return [{"title": "无可评审正文", "text": "", "chars": 0}]
         segments = []
         current_title = ""
         current_parts = []
@@ -360,6 +411,45 @@ class MultiAgentJudge:
             segments.append(self._make_segment(current_title, current_parts))
 
         return segments or [{"title": "完整报告", "text": text, "chars": len(text)}]
+
+    def _build_supplemental_evidence_note(self, reviewer: dict, supplemental_evidence: str) -> str:
+        evidence = (supplemental_evidence or "").strip()
+        if not evidence:
+            return ""
+
+        reviewer_name = reviewer.get("name", "")
+        limit = self.SUPPLEMENTAL_EVIDENCE_LIMIT
+        if "写作" in reviewer_name or "结构" in reviewer_name:
+            limit = 900
+        elif "实验方法" in reviewer_name:
+            limit = 4200
+
+        clipped = evidence[:limit]
+        if len(evidence) > limit:
+            clipped += "\n...（补充证据已截断，正文评分仍以当前报告片段为准）"
+        return (
+            "\n\n补充证据包（只用于核对事实一致性，不属于待评分正文；"
+            "不要因为证据包含 JSON、代码或片段化内容而扣报告格式分）：\n"
+            f"{clipped}"
+        )
+
+    def _select_reviewers(self, reviewer_names: Optional[list[str]]) -> list[dict]:
+        if not reviewer_names:
+            return list(self.reviewers)
+        wanted = set(reviewer_names)
+        selected = [reviewer for reviewer in self.reviewers if reviewer.get("name") in wanted]
+        return selected or list(self.reviewers)
+
+    def _is_reviewable_report_block(self, title: str, block_text: str) -> bool:
+        title_text = title or ""
+        body = (block_text or "").strip()
+        if not body:
+            return False
+        if "核心代码实现" in title_text:
+            return False
+        if body.startswith("```") and body.endswith("```"):
+            return False
+        return True
 
     def _split_report_blocks(self, text: str) -> list[tuple[str, str]]:
         blocks = []
@@ -733,7 +823,20 @@ sections 要求：
                 evidence_context = self._build_reflection_evidence_context(outputs)
                 if rule_changes and self._has_unfixable_upstream_blockers(scoring_breakdown, outputs):
                     final_report = rule_fixed_report
-                    rescored_score, rescored_breakdown = self._score_report(query, final_report, outputs)
+                    rescored_score, rescored_breakdown = self._score_report(
+                        query,
+                        final_report,
+                        outputs,
+                        use_llm_judges=not self._has_upstream_context(outputs),
+                        judge_score_override=scoring_breakdown.get("judge_score"),
+                        targeted_review_sections=target_sections,
+                        targeted_reviewer_names=self._select_reflection_reviewer_names(scoring_breakdown, target_sections),
+                    )
+                    rescore_status = (
+                        "accepted_targeted_rescore"
+                        if rescored_breakdown.get("method") == "hybrid_rule_targeted_llm_after_reflection"
+                        else "accepted_rule_only"
+                    )
                     accepted_rounds += 1
                     reflection_log.append(
                         {
@@ -742,8 +845,8 @@ sections 要求：
                             "score_after": rescored_score.overall,
                             "improved": True,
                             "accepted": True,
-                            "status": "accepted_rule_only",
-                            "reason": "remaining hard findings require upstream rerun; rule fixes applied and final report was rescored",
+                            "status": rescore_status,
+                            "reason": "remaining hard findings require upstream rerun; rule fixes applied and modified sections were rescored",
                             "rule_changes": rule_changes,
                             "target_sections": [section.get("heading", "") for section in target_sections],
                         }
@@ -782,7 +885,20 @@ sections 要求：
 
                 if self._has_unfixable_upstream_blockers(scoring_breakdown, outputs):
                     final_report = revised_report
-                    rescored_score, rescored_breakdown = self._score_report(query, final_report, outputs)
+                    rescored_score, rescored_breakdown = self._score_report(
+                        query,
+                        final_report,
+                        outputs,
+                        use_llm_judges=not self._has_upstream_context(outputs),
+                        judge_score_override=scoring_breakdown.get("judge_score"),
+                        targeted_review_sections=target_sections,
+                        targeted_reviewer_names=self._select_reflection_reviewer_names(scoring_breakdown, target_sections),
+                    )
+                    rescore_status = (
+                        "accepted_after_targeted_rescore"
+                        if rescored_breakdown.get("method") == "hybrid_rule_targeted_llm_after_reflection"
+                        else "accepted_after_rescore"
+                    )
                     accepted_rounds += 1
                     reflection_log.append(
                         {
@@ -791,8 +907,8 @@ sections 要求：
                             "score_after": rescored_score.overall,
                             "improved": True,
                             "accepted": True,
-                            "status": "accepted_after_rescore",
-                            "reason": "remaining hard findings require upstream rerun; final report was rescored after accepted revision",
+                            "status": rescore_status,
+                            "reason": "remaining hard findings require upstream rerun; modified sections were rescored after accepted revision",
                             "rule_changes": rule_changes,
                             "target_sections": [section.get("heading", "") for section in target_sections],
                         }
@@ -803,7 +919,15 @@ sections 要求：
                     break
 
                 revised_text = self._render_report_text(revised_report)
-                new_score, new_breakdown = self._score_report(query, revised_report, outputs)
+                new_score, new_breakdown = self._score_report(
+                    query,
+                    revised_report,
+                    outputs,
+                    use_llm_judges=not self._has_upstream_context(outputs),
+                    judge_score_override=scoring_breakdown.get("judge_score"),
+                    targeted_review_sections=target_sections,
+                    targeted_reviewer_names=self._select_reflection_reviewer_names(scoring_breakdown, target_sections),
+                )
                 improved = new_score.overall > final_score.overall
                 # Track whether each reflection round actually improves quality.
                 reflection_log.append(
@@ -1006,12 +1130,65 @@ sections 要求：
         merged["sections"] = merged_sections
         return merged if changed else None
 
-    def _score_report(self, query: str, report_content: dict, outputs: dict) -> tuple[EvalScore, dict]:
+    def _score_report(
+        self,
+        query: str,
+        report_content: dict,
+        outputs: dict,
+        *,
+        use_llm_judges: bool = True,
+        judge_score_override: Optional[dict | EvalScore] = None,
+        targeted_review_sections: Optional[list[dict]] = None,
+        targeted_reviewer_names: Optional[list[str]] = None,
+    ) -> tuple[EvalScore, dict]:
         """Score the report with multi-agent judgement plus deterministic upstream checks."""
         report_text = self._render_report_text(report_content)
-        judge_score, judge_reviews = self._score_with_judges(query, report_text)
-        upstream_keys = ("literature_result", "experiment_design", "code_result", "analysis_result")
-        has_upstream_context = any(outputs.get(key) not in (None, {}, [], "") for key in upstream_keys)
+        has_upstream_context = self._has_upstream_context(outputs)
+        supplemental_evidence = self._build_judge_evidence_package(outputs) if has_upstream_context else ""
+        targeted_review_used = False
+        if use_llm_judges:
+            judge_score, judge_reviews = self._score_with_judges(
+                query,
+                report_text,
+                supplemental_evidence=supplemental_evidence,
+            )
+        else:
+            reused_judge_score = self._coerce_eval_score(judge_score_override) or EvalScore(
+                0.65,
+                0.65,
+                0.65,
+                0.65,
+                "复用上一轮 LLM 专家意见。",
+                False,
+                "",
+            )
+            judge_reviews = [
+                {
+                    "reviewer": "reused_llm_judgement",
+                    "weight": 1.0,
+                    "rubric": "reflection rescore",
+                    "score": reused_judge_score.__dict__,
+                    "note": "Previous full-report LLM judgement reused as the baseline for targeted reflection rescore.",
+                }
+            ]
+            targeted_text = self._render_targeted_review_text(report_content, targeted_review_sections)
+            if targeted_text.strip():
+                targeted_score, targeted_reviews = self._score_with_judges(
+                    query,
+                    targeted_text,
+                    output_type="report revised sections",
+                    supplemental_evidence=supplemental_evidence,
+                    reviewer_names=targeted_reviewer_names,
+                    focus_note=(
+                        "请只复评本轮被规则修复或反思改写的章节，判断修改是否解决对应问题；"
+                        "不要因为没有重新看到全文而惩罚完整性。"
+                    ),
+                )
+                judge_score = self._merge_reused_and_targeted_judge_score(reused_judge_score, targeted_score)
+                judge_reviews.extend(targeted_reviews)
+                targeted_review_used = True
+            else:
+                judge_score = reused_judge_score
         if not has_upstream_context:
             scoring_context = {
                 "llm_expert_score": judge_score.overall,
@@ -1034,7 +1211,7 @@ sections 要求：
         scores = breakdown["scores"]
         findings = breakdown["findings"]
 
-        overall = round(
+        rule_overall = round(
             0.20 * scores["evidence_grounding"]
             + 0.20 * scores["experiment_consistency"]
             + 0.20 * scores["execution_validity"]
@@ -1043,15 +1220,22 @@ sections 要求：
             + 0.10 * scores["format_quality"],
             3,
         )
+        overall = round(0.50 * judge_score.overall + 0.50 * rule_overall, 3)
+        if any(item.get("severity") == "hard" for item in findings):
+            overall = min(overall, max(0.35, rule_overall + 0.12))
         accuracy = round(
-            0.55 * scores["evidence_grounding"]
-            + 0.25 * scores["result_faithfulness"]
-            + 0.20 * scores["execution_validity"],
+            0.50 * judge_score.accuracy
+            + 0.50
+            * (
+                0.55 * scores["evidence_grounding"]
+                + 0.25 * scores["result_faithfulness"]
+                + 0.20 * scores["execution_validity"]
+            ),
             3,
         )
-        completeness = round(scores["completeness"], 3)
+        completeness = round(0.60 * judge_score.completeness + 0.40 * scores["completeness"], 3)
         format_quality = round(scores["format_quality"], 3)
-        needs_reflection = overall < 0.75 or any(item.get("severity") == "hard" for item in findings)
+        needs_reflection = overall < 0.75 or rule_overall < 0.65 or any(item.get("severity") == "hard" for item in findings)
 
         suggestion = (
             "Revise the report so claims are grounded in literature, experiment design, "
@@ -1069,20 +1253,31 @@ sections 要求：
             needs_reflection=needs_reflection,
             reflection_suggestion=suggestion,
         )
-        breakdown["method"] = "hybrid_rule_multi_agent_llm"
+        if use_llm_judges:
+            breakdown["method"] = "hybrid_rule_multi_agent_llm"
+        elif targeted_review_used:
+            breakdown["method"] = "hybrid_rule_targeted_llm_after_reflection"
+        else:
+            breakdown["method"] = "hybrid_rule_reused_llm_after_reflection"
         breakdown["weights"] = {
-            "evidence_grounding": 0.20,
-            "experiment_consistency": 0.20,
-            "execution_validity": 0.20,
-            "result_faithfulness": 0.15,
-            "completeness": 0.15,
-            "format_quality": 0.10,
+            "score_layers": {
+                "llm_expert_score": 0.50,
+                "rule_consistency_score": 0.50,
+            },
+            "rule_dimensions": {
+                "evidence_grounding": 0.20,
+                "experiment_consistency": 0.20,
+                "execution_validity": 0.20,
+                "result_faithfulness": 0.15,
+                "completeness": 0.15,
+                "format_quality": 0.10,
+            },
         }
         breakdown["judge_score"] = judge_score.__dict__
         breakdown["judge_reviews"] = judge_reviews
         breakdown["display_scores"] = {
             "llm_expert_score": judge_score.overall,
-            "rule_consistency_score": overall,
+            "rule_consistency_score": rule_overall,
             "final_deliverable_score": overall,
             "rule_dimension_scores": scores,
             "weights": breakdown["weights"],
@@ -1099,12 +1294,30 @@ sections 要求：
         breakdown["final_score"] = final_score.__dict__
         return final_score, breakdown
 
-    def _score_with_judges(self, query: str, report_text: str) -> tuple[EvalScore, list[dict]]:
+    def _score_with_judges(
+        self,
+        query: str,
+        report_text: str,
+        output_type: str = "report",
+        supplemental_evidence: str = "",
+        reviewer_names: Optional[list[str]] = None,
+        focus_note: str = "",
+    ) -> tuple[EvalScore, list[dict]]:
         if hasattr(self.judge, "score_many"):
-            return self.judge.score_many(query, report_text)
+            try:
+                return self.judge.score_many(
+                    query,
+                    report_text,
+                    output_type=output_type,
+                    supplemental_evidence=supplemental_evidence,
+                    reviewer_names=reviewer_names,
+                    focus_note=focus_note,
+                )
+            except TypeError:
+                return self.judge.score_many(query, report_text)
 
         # Test doubles and older integrations may only implement score().
-        score = self.judge.score(query, report_text)
+        score = self.judge.score(query, report_text, output_type=output_type)
         return score, [
             {
                 "reviewer": "single_judge",
@@ -1113,6 +1326,156 @@ sections 要求：
                 "score": score.__dict__,
             }
         ]
+
+    def _render_targeted_review_text(self, report_content: dict, target_sections: Optional[list[dict]]) -> str:
+        if not target_sections:
+            return ""
+        sections = report_content.get("sections", []) or []
+        selected = []
+        seen_indices = set()
+        for target in target_sections:
+            if not isinstance(target, dict):
+                continue
+            idx = target.get("index")
+            if isinstance(idx, str) and idx.isdigit():
+                idx = int(idx)
+            section = None
+            if isinstance(idx, int) and 0 <= idx < len(sections):
+                section = sections[idx]
+                seen_indices.add(idx)
+            else:
+                heading = self._safe_text(target.get("heading", ""))
+                for candidate_idx, candidate in enumerate(sections):
+                    if candidate_idx in seen_indices:
+                        continue
+                    if heading and self._safe_text(candidate.get("heading", "")) == heading:
+                        section = candidate
+                        seen_indices.add(candidate_idx)
+                        break
+            if not section:
+                continue
+            heading = self._safe_text(section.get("heading", "被修改章节"))
+            body = self._safe_text(section.get("body", ""))
+            if body:
+                selected.append(f"## {heading}\n{body}")
+        return "\n\n".join(selected)
+
+    def _select_reflection_reviewer_names(
+        self,
+        scoring_breakdown: dict,
+        target_sections: Optional[list[dict]],
+    ) -> list[str]:
+        reviewers = set()
+        findings = scoring_breakdown.get("findings", []) if isinstance(scoring_breakdown, dict) else []
+        for finding in findings:
+            dimension = self._safe_text((finding or {}).get("dimension", ""))
+            if dimension in {"evidence_grounding", "result_faithfulness", "execution_validity"}:
+                reviewers.add("证据一致性评审专家")
+            if dimension in {"experiment_consistency", "execution_validity"}:
+                reviewers.add("实验方法评审专家")
+            if dimension in {"completeness", "format_quality"}:
+                reviewers.add("论文写作与结构评审专家")
+
+        for section in target_sections or []:
+            heading = self._safe_text((section or {}).get("heading", ""))
+            if any(token in heading for token in ("实验", "指标", "基线", "方法", "代码", "结果")):
+                reviewers.add("实验方法评审专家")
+            if any(token in heading for token in ("摘要", "背景", "结论", "证据边界", "执行状态")):
+                reviewers.add("论文写作与结构评审专家")
+
+        return list(reviewers or {"证据一致性评审专家", "实验方法评审专家"})
+
+    def _merge_reused_and_targeted_judge_score(self, reused: EvalScore, targeted: EvalScore) -> EvalScore:
+        reused_weight = 0.55
+        targeted_weight = 0.45
+
+        def merged(attr: str) -> float:
+            return round(
+                reused_weight * getattr(reused, attr)
+                + targeted_weight * getattr(targeted, attr),
+                3,
+            )
+
+        feedback = (
+            f"上一轮全文评审基准：{reused.feedback or '无详细反馈'}；"
+            f"本轮相关专家章节复评：{targeted.feedback or '无详细反馈'}"
+        )
+        suggestion = "；".join(
+            item
+            for item in [reused.reflection_suggestion, targeted.reflection_suggestion]
+            if item
+        )
+        return EvalScore(
+            overall=merged("overall"),
+            accuracy=merged("accuracy"),
+            completeness=merged("completeness"),
+            format_quality=merged("format_quality"),
+            feedback=feedback,
+            needs_reflection=targeted.needs_reflection
+            or targeted.overall < getattr(self.config.evaluation, "score_threshold", 0.65),
+            reflection_suggestion=suggestion,
+        )
+
+    def _has_upstream_context(self, outputs: dict) -> bool:
+        upstream_keys = ("literature_result", "experiment_design", "code_result", "analysis_result")
+        return any(outputs.get(key) not in (None, {}, [], "") for key in upstream_keys)
+
+    def _coerce_eval_score(self, value: Optional[dict | EvalScore]) -> Optional[EvalScore]:
+        if isinstance(value, EvalScore):
+            return value
+        if not isinstance(value, dict):
+            return None
+        return EvalScore(
+            overall=_clamp_score(value.get("overall", value.get("overall_score", 0.65))),
+            accuracy=_clamp_score(value.get("accuracy", 0.65)),
+            completeness=_clamp_score(value.get("completeness", 0.65)),
+            format_quality=_clamp_score(value.get("format_quality", 0.65)),
+            feedback=str(value.get("feedback", "")),
+            needs_reflection=bool(value.get("needs_reflection", False)),
+            reflection_suggestion=str(value.get("reflection_suggestion", "")),
+        )
+
+    def _build_judge_evidence_package(self, outputs: dict) -> str:
+        """Build compact upstream evidence for LLM reviewers without mixing it into the report body."""
+        lit_result = outputs.get("literature_result", {}) or {}
+        exp_design = self._normalize_experiment_design_payload(outputs.get("experiment_design", {}) or {})
+        code_result = outputs.get("code_result", {}) or {}
+        analysis_result = outputs.get("analysis_result", {}) or {}
+        papers = lit_result.get("top_papers") or lit_result.get("papers") or []
+        total_found = lit_result.get("total_found", len(papers))
+        evidence = {
+            "literature": {
+                "total_found": total_found,
+                "paper_titles": [self._safe_text(paper.get("title", "")) for paper in papers[:5]],
+                "literature_review_excerpt": self._safe_text(lit_result.get("literature_review", ""))[:1200],
+            },
+            "experiment_design": {
+                "research_hypothesis": exp_design.get("research_hypothesis", ""),
+                "metrics": exp_design.get("metrics", []),
+                "baselines": exp_design.get("baselines", []),
+                "procedure": exp_design.get("procedure", []),
+                "sections": exp_design.get("sections", []),
+            },
+            "code_result": {
+                "success": code_result.get("success"),
+                "final_code_excerpt": self._safe_text(code_result.get("final_code", ""))[:1800],
+                "stdout_excerpt": self._safe_text(code_result.get("stdout", ""))[:800],
+                "error": self._safe_text(code_result.get("error") or code_result.get("stderr") or "")[:600],
+            },
+            "analysis_result": {
+                "conclusion": self._safe_text(analysis_result.get("conclusion", ""))[:900],
+                "charts": self._summarize_chart_evidence(analysis_result.get("charts", []) or []),
+            },
+        }
+        return (
+            "【补充证据包：前置模块结构化结果】\n"
+            f"{json.dumps(evidence, ensure_ascii=False, indent=2)}\n\n"
+            "评审提示：以上内容只作为事实核对依据，不属于最终报告正文。"
+            "请优先评审当前报告正文的学术质量、章节表达和结论合理性；需要判断事实一致性时，再参考该证据包。"
+            "尤其是实验方法评审专家，"
+            "需要重点核对 CodeAgent 的代码实现是否落实了实验设计中的数据集、基线、指标、流程、变量控制和消融要求，"
+            "而不是只检查代码是否能运行。"
+        )
 
     def _build_review_summary(
         self,
@@ -1147,25 +1510,72 @@ sections 要求：
 
         role_reviews = []
         for item in judge_reviews:
+            reviewer = item.get("reviewer", "评审角色")
+            if reviewer == "reused_llm_judgement":
+                continue
             score_data = item.get("score", {}) or {}
             if isinstance(score_data, EvalScore):
                 score_data = score_data.__dict__
+            brief = self._clean_review_brief(score_data.get("feedback", ""))
             role_reviews.append(
                 {
-                    "reviewer": item.get("reviewer", "评审角色"),
+                    "reviewer": reviewer,
                     "weight": item.get("weight", 1.0),
                     "overall_score": _clamp_score(score_data.get("overall", score_data.get("overall_score", 0.0)), 0.0),
-                    "brief": self._safe_text(score_data.get("feedback", "")) or "未提供详细意见",
+                    "brief": brief,
                     "suggestion": self._safe_text(score_data.get("reflection_suggestion", "")),
                 }
             )
         return {"overall": overall, "role_reviews": role_reviews}
+
+    def _clean_review_brief(self, feedback: str) -> str:
+        """Make reviewer feedback report-friendly by removing segment labels and mock fallbacks."""
+        text = self._safe_text(feedback)
+        if not text:
+            return "该评审角色未返回可展示的文字意见，请参考综合评审意见与结构化评分。"
+
+        parts = re.split(r"\s*[；|]\s*", text)
+        cleaned_parts = []
+        for part in parts:
+            cleaned = self._strip_review_segment_label(part)
+            if not cleaned or cleaned in {"Mock 评分", "无详细反馈"}:
+                continue
+            if "Mock 评分" in cleaned:
+                continue
+            if cleaned not in cleaned_parts:
+                cleaned_parts.append(cleaned)
+
+        if not cleaned_parts:
+            return "该评审角色未返回可展示的文字意见，请参考综合评审意见与结构化评分。"
+        return "；".join(cleaned_parts[:3])
+
+    def _strip_review_segment_label(self, text: str) -> str:
+        cleaned = self._safe_text(text)
+        if not cleaned:
+            return ""
+        prefix, sep, suffix = cleaned.partition("：")
+        if sep and self._looks_like_segment_label(prefix):
+            cleaned = suffix.strip()
+        return cleaned
+
+    def _looks_like_segment_label(self, prefix: str) -> bool:
+        label = self._safe_text(prefix)
+        if not label:
+            return False
+        if "/" in label:
+            return True
+        if len(label) > 40:
+            return True
+        if label in {"报告开头", "完整报告", "无可评审正文"}:
+            return True
+        return bool(re.search(r"^(#{1,3}\s*)?(\d+(\.\d+)?|[一二三四五六七八九十]+、)", label))
 
     def _format_score_layer_note(self, final_score: EvalScore, scoring_context: Optional[dict]) -> str:
         if not scoring_context:
             return ""
         llm_score = scoring_context.get("llm_expert_score")
         rule_score = scoring_context.get("rule_consistency_score", final_score.overall)
+        final_score_value = scoring_context.get("final_deliverable_score", final_score.overall)
         try:
             llm_score_text = f"{float(llm_score):.3f}"
         except Exception:
@@ -1174,11 +1584,15 @@ sections 要求：
             rule_score_text = f"{float(rule_score):.3f}"
         except Exception:
             rule_score_text = f"{final_score.overall:.3f}"
+        try:
+            final_score_text = f"{float(final_score_value):.3f}"
+        except Exception:
+            final_score_text = f"{final_score.overall:.3f}"
         return (
             "评分说明：LLM 专家评审分为 "
-            f"{llm_score_text}，规则一致性/最终可交付评分为 {rule_score_text}。"
-            "最终分优先反映文献、实验设计、代码执行和分析结果是否形成证据闭环，"
-            "不等同于各专家分数的简单平均。"
+            f"{llm_score_text}，规则一致性校准分为 {rule_score_text}，最终可交付评分为 {final_score_text}。"
+            "当前最终分由 LLM 多专家评审与规则一致性校准各占 50%；"
+            "若存在代码失败、证据缺失或实验结果不一致等高风险问题，最终分会被保守封顶。"
         )
 
     def _format_review_feedback(self, review_summary: dict) -> str:
@@ -1368,7 +1782,8 @@ sections 要求：
             ("优于基线", "与基线的相对表现仍需验证"),
             ("显著优于", "是否优于仍需验证"),
             ("实测部署", "待完成部署验证"),
-            ("完成了从理论压缩到物理实现的闭环验证", "尚未完成从理论压缩到物理实现的闭环验证"),
+            ("完成了从理论方案到实际实现的闭环验证", "尚未完成从理论方案到实际实现的闭环验证"),
+            ("完成了从理论压缩到物理实现的闭环验证", "尚未完成从理论方案到实际实现的闭环验证"),
             ("有力支撑了研究假设", "仍需在代码成功运行后支撑研究假设"),
             ("验证了该策略", "尚未验证该策略"),
             ("outperforms", "requires further validation against"),
@@ -1465,7 +1880,7 @@ sections 要求：
         except Exception:
             total_found = len(papers)
 
-        evidence_grounding = 0.85 if total_found > 0 or papers else 0.65
+        evidence_grounding = 0.80 if total_found > 0 or papers else 0.55
         broad_lit_claims = [
             "已有研究",
             "大量研究",
@@ -1495,7 +1910,7 @@ sections 要求：
             )
 
         experiment_text = self._experiment_sections_text(report_content)
-        experiment_consistency = 0.85 if exp_design else 0.55
+        experiment_consistency = 0.80 if exp_design else 0.50
         experiment_checks = [
             ("3.1", exp_design.get("research_hypothesis", ""), "research hypothesis"),
             ("3.x", exp_design.get("metrics", []), "metrics"),
@@ -1528,7 +1943,7 @@ sections 要求：
                     }
                 )
 
-        execution_validity = 0.65
+        execution_validity = 0.55
         success = code_result.get("success")
         if success is True:
             execution_validity = 0.90 if self._safe_text(code_result.get("stdout")) else 0.80
@@ -1555,16 +1970,23 @@ sections 要求：
                 }
             )
 
-        result_faithfulness = 0.80
+        result_faithfulness = 0.75
         metrics = self._list_values(exp_design.get("metrics", []))
         metric_claim_terms = metrics + [
-            "mAP",
-            "FPS",
-            "FLOPs",
             "Accuracy",
             "F1",
             "AUC",
             "BLEU",
+            "ROUGE",
+            "RMSE",
+            "MAE",
+            "latency",
+            "throughput",
+            "准确率",
+            "召回率",
+            "精确率",
+            "延迟",
+            "吞吐量",
             "%",
             "百分点",
             "p=",
@@ -1585,7 +2007,7 @@ sections 要求：
                 }
             )
         elif not has_analysis_evidence:
-            result_faithfulness = 0.60
+            result_faithfulness = 0.55
             findings.append(
                 {
                     "dimension": "result_faithfulness",
@@ -2252,7 +2674,7 @@ sections 要求：
             ),
             "objectives": [
                 "明确待验证方法相对原始方案或主流方案的性能变化。",
-                "量化方法在计算开销、运行效率或资源占用方面的影响。",
+                "量化方法在计算开销、运行效率、资源占用或实际应用效果方面的影响。",
                 "通过对照组和消融实验分析关键组件的实际贡献。",
             ],
             "dataset": (
@@ -2266,7 +2688,7 @@ sections 要求：
             ],
             "metrics": [
                 "任务性能指标: 根据具体任务选择准确率、误差、召回率或相关主指标，衡量方法有效性。",
-                "效率指标: 统计推理延迟、吞吐量、FLOPs 或运行时间，衡量部署效率。",
+                "效率指标: 根据具体任务统计响应延迟、吞吐量、运行时间或通信开销，衡量执行效率。",
                 "资源指标: 统计参数量、显存占用或模型大小，衡量资源约束下的可用性。",
             ],
             "variables": {
@@ -2563,13 +2985,13 @@ sections 要求：
         if objectives:
             lines.append(
                 "设计逻辑：本实验采用由研究假设牵引的对照实验框架，"
-                f"核心目标包括{objectives}。这些目标共同对应模型压缩任务中“性能保持、资源节省与部署可行性”"
-                "之间的权衡关系。"
+                f"核心目标包括{objectives}。这些目标共同界定了目标方法在任务效果、资源约束与实际应用可行性"
+                "之间需要验证的权衡关系。"
             )
         else:
             lines.append(
-                "设计逻辑：本实验采用由研究假设牵引的对照实验框架，围绕模型压缩后的性能保持、资源开销"
-                "与部署可行性展开验证。"
+                "设计逻辑：本实验采用由研究假设牵引的对照实验框架，围绕目标方法的任务效果、资源开销"
+                "与应用可行性展开验证。"
             )
 
         if metrics_count or baselines_count:
@@ -2582,7 +3004,7 @@ sections 要求：
 
         if procedure:
             lines.append(
-                f"实验组织：整体流程按照{procedure}的顺序推进，先建立可比较的基线状态，再实施压缩或改进策略，"
+                f"实验组织：整体流程按照{procedure}的顺序推进，先建立可比较的基线状态，再实施目标方法或改进策略，"
                 "最后在统一评价协议下比较结果。"
             )
 
@@ -2730,12 +3152,12 @@ sections 要求：
             paragraphs.append(
                 "围绕这一假设，实验目标被组织为几个相互关联的验证任务："
                 f"{self._format_inline_experiment_items(objectives)}。"
-                "这些目标共同构成后续评价的判断框架，使实验不只关注单一结果，而是能够说明压缩策略在不同约束下的表现。"
+                "这些目标共同构成后续评价的判断框架，使实验不只关注单一结果，而是能够说明目标方法在不同约束下的表现。"
             )
         if procedure:
             paragraphs.append(
                 f"在执行顺序上，目标验证将依托{procedure}等步骤展开，先形成可比较的基线状态，"
-                "再观察压缩或改进策略是否符合假设预期。"
+                "再观察目标方法或改进策略是否符合假设预期。"
             )
         return "\n\n".join(paragraphs)
 
@@ -2752,8 +3174,8 @@ sections 要求：
         return (
             "本节将评估指标设计为连接研究假设与实验结论的核心桥梁。"
             f"实验设计阶段给出的指标包括{metric_text}。"
-            "这些指标分别从任务性能、效率或资源约束等角度刻画模型压缩后的变化，"
-            "因此在后续结果分析中不能孤立解读单个数值，而应结合基线方法和实验流程判断压缩策略是否真正满足研究目标。"
+            "这些指标分别从任务性能、效率、资源约束或应用效果等角度刻画目标方法带来的变化，"
+            "因此在后续结果分析中不能孤立解读单个数值，而应结合基线方法和实验流程判断目标方法是否真正满足研究目标。"
             "若代码执行阶段尚未产生真实指标，本节中的指标仅作为后续验证协议，而不能被写成已经获得的实测结果。"
         )
 
@@ -2768,9 +3190,9 @@ sections 要求：
 
         baseline_text = self._join_experiment_items_for_prose(baselines)
         return (
-            "本节的基线设计用于建立压缩方法的比较参照，避免只讨论单个模型的绝对表现。"
+            "本节的基线设计用于建立目标方法的比较参照，避免只讨论单一方案的绝对表现。"
             f"实验设计阶段给出的对照方法包括{baseline_text}。"
-            "这些基线共同覆盖未压缩上限、常规压缩策略或替代轻量化路径，使后续实验能够比较不同方案在性能保持和资源节省上的取舍。"
+            "这些基线共同覆盖原始方案、主流方法或关键组件变体，使后续实验能够比较不同方案在任务效果、资源开销和稳定性上的取舍。"
             "结合训练条件、硬件环境和统计检验方式，本节能够支撑后续形成完整的对照实验设计。"
         )
 
@@ -2857,7 +3279,7 @@ sections 要求：
             "预期结果，为后续验证提供了较完整的方案基础。\n\n"
             "不过，需要明确的是，代码执行模块当前返回失败状态，因此本报告不能将设计目标或预期结果表述为已经"
             "得到验证的实验发现。现阶段更合理的结论是：该方案具备进一步实现和验证的研究价值，但其实际性能、"
-            "压缩收益、推理速度和相对基线优势仍需在代码成功运行后重新评估。后续改进应优先定位执行失败原因，"
+            "资源效率、运行表现和相对基线优势仍需在代码成功运行后重新评估。后续改进应优先定位执行失败原因，"
             "补齐可复现实验日志和指标计算流程，再由分析模块输出结构化结果，最后更新结果章节和摘要。"
         )
 
@@ -3036,21 +3458,24 @@ sections 要求：
     def _build_abstract(self, query: str, report_body: str) -> str:
         summary_body = self._sanitize_text_for_abstract(report_body)
         prompt = (
-            f"请基于已经完成的科研报告正文，为研究问题“{query}”撰写中文摘要。\n\n"
+            f"请基于已经完成的科研报告正文，为研究问题“{query}”撰写中文学术论文摘要。\n\n"
             f"报告正文如下：\n{summary_body[:6000]}\n\n"
             "写作要求：\n"
-            "1. 摘要必须严格基于正文内容总结，不要根据固定模板重写，不要补充正文中没有的信息。\n"
-            "2. 用一段或两段连续学术表述概括研究背景、方法、实验设置、核心结果与结论。\n"
-            "3. 控制在 180 到 260 字之间，风格接近论文摘要。\n"
-            "4. 摘要中的研究假设、指标、基线和实验结论必须与正文第三章及结果章节一致。\n"
-            "5. 如果正文说明代码执行失败或证据不足，不得写成实验已验证成功，也不得新增量化提升。\n"
-            "6. 不要使用项目符号，不要写“本文将”这类尚未完成时态，保持结果导向。"
+            "1. 写成正式论文摘要，而不是正文目录式总结；不要出现“本报告首先/随后/最后”等流水账表达。\n"
+            "2. 摘要应自然覆盖研究目的、核心方法或实验设计、关键证据/结果状态、结论与局限四个要素。\n"
+            "3. 必须严格基于正文内容，不要补充正文中没有的模型、数据集、指标数值、实验结论或文献结论。\n"
+            "4. 如果正文说明代码执行失败、分析证据不足或实验尚未完成，应以论文摘要语气说明验证受限，不能写成实验已成功证明。\n"
+            "5. 控制在 180 到 260 字之间，采用一段连续学术表述，不使用项目符号，不输出标题。\n"
+            "6. 摘要中的研究假设、指标、基线和实验结论必须与正文第三章及结果章节一致。"
         )
         abstract = self.llm.chat(
             [
                 {
                     "role": "system",
-                    "content": "你是资深学术写作专家，请根据给定正文生成准确、简洁、论文风格的中文摘要。",
+                    "content": (
+                        "你是中文学术论文写作专家。请生成符合论文规范的摘要，"
+                        "强调研究目的、方法、结果状态和结论边界，而不是简单复述章节安排。"
+                    ),
                 },
                 {"role": "user", "content": prompt},
             ],
