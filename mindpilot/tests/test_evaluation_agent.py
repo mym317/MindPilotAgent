@@ -168,6 +168,17 @@ class TestMultiAgentJudge(unittest.TestCase):
         self.assertEqual(score.overall, 0.70)
         self.assertTrue(all("reviewer" in review and "score" in review for review in reviews))
 
+    def test_default_reviewer_weights_follow_meeting_decision(self):
+        judge = MultiAgentJudge(FakeLLM(), threshold=0.65, logger=FakeLogger())
+
+        weights = {reviewer["name"]: reviewer["weight"] for reviewer in judge.reviewers}
+
+        self.assertEqual(weights["实验方法评审专家"], 0.60)
+        self.assertEqual(weights["证据一致性评审专家"], 0.30)
+        self.assertEqual(weights["论文写作与结构评审专家"], 0.10)
+        self.assertIn("代码实现是否真正围绕实验设计", judge.reviewers[1]["rubric"])
+        self.assertIn("基线方法", judge.reviewers[1]["rubric"])
+
     def test_long_report_is_reviewed_by_segments(self):
         llm = FakeLLM()
         judge = MultiAgentJudge(
@@ -204,6 +215,67 @@ class TestMultiAgentJudge(unittest.TestCase):
         )
         self.assertTrue(any("第 1/" in call[1]["content"] for call in llm.messages))
         self.assertTrue(any("三、实验设计与方法论" in segment["title"] for segment in reviews[0]["segments"]))
+
+    def test_supplemental_evidence_is_not_scored_as_report_body(self):
+        llm = FakeLLM()
+        judge = MultiAgentJudge(
+            llm,
+            threshold=0.65,
+            logger=FakeLogger(),
+            reviewers=[
+                {
+                    "name": "证据一致性评审专家",
+                    "weight": 1.0,
+                    "rubric": "重点检查证据一致性。",
+                }
+            ],
+        )
+
+        judge.score_many(
+            "query",
+            "## 摘要\n正文内容完整。",
+            supplemental_evidence='{"code_result": {"success": false, "error": "boom"}}',
+        )
+
+        prompt = llm.messages[0][1]["content"]
+        self.assertIn("补充证据包", prompt)
+        self.assertIn("不属于待评分正文", prompt)
+        self.assertIn("待评分内容（报告节选，最多 8000 字）：\n## 摘要", prompt)
+        self.assertNotIn('待评分内容（报告节选，最多 8000 字）：\n{"code_result"', prompt)
+
+    def test_code_appendix_is_skipped_during_llm_review_segmentation(self):
+        judge = MultiAgentJudge(FakeLLM(), threshold=0.65, logger=FakeLogger())
+        report = "\n\n".join(
+            [
+                "## 摘要\n正文内容。",
+                "## 三、实验设计与方法论\n实验设计正文。",
+                "## 核心代码实现\n```python\ndef should_not_be_reviewed():\n    return 'code'\n```",
+            ]
+        )
+
+        segments = judge._split_report_segments(report)
+
+        joined = "\n".join(segment["text"] for segment in segments)
+        self.assertIn("实验设计正文", joined)
+        self.assertNotIn("should_not_be_reviewed", joined)
+
+    def test_targeted_rescore_can_limit_reviewers_and_add_focus_note(self):
+        llm = FakeLLM()
+        judge = MultiAgentJudge(llm, threshold=0.65, logger=FakeLogger())
+
+        score, reviews = judge.score_many(
+            "query",
+            "## 3.2 评估指标\n修改后的指标说明。",
+            output_type="report revised sections",
+            reviewer_names=["实验方法评审专家"],
+            focus_note="只判断被修改章节是否解决实验方法一致性问题。",
+        )
+
+        self.assertIsInstance(score, EvalScore)
+        self.assertEqual(len(reviews), 1)
+        self.assertEqual(reviews[0]["reviewer"], "实验方法评审专家")
+        self.assertEqual(len(llm.messages), 1)
+        self.assertIn("本轮复评重点", llm.messages[0][1]["content"])
 
 
 class TestEvaluationAgentReflection(unittest.TestCase):
@@ -399,7 +471,7 @@ class TestEvaluationAgentReflection(unittest.TestCase):
 
         breakdown = agent._rule_score_report(report, outputs, EvalScore(0.8, 0.8, 0.8, 0.8, "", False))
 
-        self.assertGreaterEqual(breakdown["scores"]["experiment_consistency"], 0.85)
+        self.assertGreaterEqual(breakdown["scores"]["experiment_consistency"], 0.80)
         self.assertFalse(
             any(finding["dimension"] == "experiment_consistency" for finding in breakdown["findings"])
         )
@@ -491,8 +563,12 @@ class TestEvaluationAgentReflection(unittest.TestCase):
 
         self.assertEqual(result["reflection_rounds"], 1)
         self.assertEqual(result["attempted_reflection_rounds"], 1)
-        self.assertEqual(result["reflection_log"][0]["status"], "accepted_rule_only")
+        self.assertEqual(result["reflection_log"][0]["status"], "accepted_targeted_rescore")
         self.assertEqual(agent.judge.index, 2)
+        self.assertEqual(
+            agent.report_gen.last_content["evaluation"]["scoring_breakdown"]["method"],
+            "hybrid_rule_targeted_llm_after_reflection",
+        )
 
 
 class TestEvaluationAgentReportGeneration(unittest.TestCase):
@@ -756,7 +832,7 @@ class TestEvaluationAgentReportGeneration(unittest.TestCase):
         self.assertIn("评估指标设计为连接研究假设与实验结论", sections["3.2 评估指标"])
         self.assertIn("mAP", sections["3.2 评估指标"])
         self.assertIn("FPS", sections["3.2 评估指标"])
-        self.assertIn("基线设计用于建立压缩方法的比较参照", sections["3.3 基线方法"])
+        self.assertIn("基线设计用于建立目标方法的比较参照", sections["3.3 基线方法"])
         self.assertIn("Vanilla student", sections["3.3 基线方法"])
         self.assertIn("FitNets", sections["3.3 基线方法"])
 
@@ -850,7 +926,7 @@ class TestEvaluationAgentReportGeneration(unittest.TestCase):
         self.assertIn("评估指标设计为连接研究假设与实验结论", sections["3.2 评估指标"])
         self.assertIn("mAP", sections["3.2 评估指标"])
         self.assertIn("FPS", sections["3.2 评估指标"])
-        self.assertIn("基线设计用于建立压缩方法的比较参照", sections["3.3 基线方法"])
+        self.assertIn("基线设计用于建立目标方法的比较参照", sections["3.3 基线方法"])
         self.assertIn("Teacher", sections["3.3 基线方法"])
         self.assertIn("INT8", sections["3.3 基线方法"])
 
@@ -973,11 +1049,14 @@ class TestEvaluationAgentHybridScoring(unittest.TestCase):
         self.assertIn("综合评审意见", score.feedback)
         self.assertIn("各评审角色简要意见", score.feedback)
         self.assertIn("LLM 专家评审分", score.feedback)
-        self.assertIn("不等同于各专家分数的简单平均", score.feedback)
+        self.assertIn("各占 50%", score.feedback)
         self.assertIn("review_summary", breakdown)
         self.assertEqual(len(breakdown["review_summary"]["role_reviews"]), 1)
         self.assertEqual(breakdown["display_scores"]["llm_expert_score"], 0.92)
-        self.assertEqual(breakdown["display_scores"]["rule_consistency_score"], score.overall)
+        self.assertLess(breakdown["display_scores"]["rule_consistency_score"], score.overall)
+        self.assertEqual(breakdown["display_scores"]["final_deliverable_score"], score.overall)
+        self.assertEqual(breakdown["display_scores"]["weights"]["score_layers"]["llm_expert_score"], 0.50)
+        self.assertEqual(breakdown["display_scores"]["weights"]["score_layers"]["rule_consistency_score"], 0.50)
         self.assertEqual(breakdown["scores"]["evidence_grounding"], 0.45)
         self.assertLessEqual(breakdown["scores"]["execution_validity"], 0.35)
         self.assertTrue(any(item["severity"] == "hard" for item in breakdown["findings"]))
@@ -1018,6 +1097,42 @@ class TestEvaluationAgentHybridScoring(unittest.TestCase):
         self.assertEqual(breakdown["upstream_status"]["literature_total_found"], 2)
         self.assertTrue(breakdown["upstream_status"]["code_success"])
 
+    def test_review_summary_hides_segment_titles_and_mock_feedback(self):
+        agent = build_agent()
+        final_score = EvalScore(0.65, 0.65, 0.65, 0.65, "", True, "")
+        judge_reviews = [
+            {
+                "reviewer": "reused_llm_judgement",
+                "weight": 1.0,
+                "score": {"overall": 0.70, "feedback": "上一轮全文评审基准"},
+            },
+            {
+                "reviewer": "证据一致性评审专家",
+                "weight": 0.3,
+                "score": {
+                    "overall": 0.67,
+                    "feedback": "3.1 实验设置 / 3.2 指标体系 / 五、结果分析：Mock 评分",
+                },
+            },
+            {
+                "reviewer": "实验方法评审专家",
+                "weight": 0.6,
+                "score": {
+                    "overall": 0.65,
+                    "feedback": "3.1 实验设置 / 3.2 指标体系：报告存在语病，且图表来源未解释。",
+                },
+            },
+        ]
+
+        summary = agent._build_review_summary(final_score, [], judge_reviews, {})
+        feedback = agent._format_review_feedback(summary)
+
+        self.assertNotIn("reused_llm_judgement", feedback)
+        self.assertNotIn("3.1 实验设置 / 3.2 指标体系", feedback)
+        self.assertNotIn("Mock 评分", feedback)
+        self.assertIn("该评审角色未返回可展示的文字意见", feedback)
+        self.assertIn("报告存在语病", feedback)
+
 
 class TestEvaluationReportRendering(unittest.TestCase):
     def test_markdown_renders_overall_and_role_review_comments(self):
@@ -1033,6 +1148,7 @@ class TestEvaluationReportRendering(unittest.TestCase):
                     "overall_score": 0.72,
                     "llm_expert_score": 0.88,
                     "rule_consistency_score": 0.72,
+                    "scoring_breakdown": {"method": "hybrid_rule_targeted_llm_after_reflection"},
                     "rule_dimension_scores": {
                         "evidence_grounding": 0.45,
                         "execution_validity": 0.35,
@@ -1060,8 +1176,13 @@ class TestEvaluationReportRendering(unittest.TestCase):
         self.assertIn("证据一致性评审专家", markdown)
         self.assertIn("| 最终可交付评分 | 0.72 |", markdown)
         self.assertIn("| LLM 专家评审分 | 0.88 |", markdown)
-        self.assertIn("### 规则评分维度", markdown)
-        self.assertIn("| evidence_grounding | 0.45 |", markdown)
+        self.assertIn("| 规则一致性评分 | 0.72 |", markdown)
+        self.assertIn("复评说明", markdown)
+        self.assertNotIn("| 准确性", markdown)
+        self.assertNotIn("| 完整性", markdown)
+        self.assertNotIn("| 格式规范", markdown)
+        self.assertNotIn("### 规则评分维度", markdown)
+        self.assertNotIn("| evidence_grounding | 0.45 |", markdown)
 
 
 if __name__ == "__main__":

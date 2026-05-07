@@ -125,6 +125,15 @@ class ReportGenerator:
             shd.set(qn('w:fill'), 'F2F2F2')
             pPr.append(shd)
 
+        def _reflection_rescore_note(ev: dict) -> str:
+            breakdown = ev.get("scoring_breakdown", {}) or {}
+            method = str(breakdown.get("method", ev.get("method", "")))
+            if "targeted_llm_after_reflection" in method:
+                return "复评说明：本报告经过反思修订后，已由相关专家对被修改章节进行定向复评。"
+            if "reused_llm_after_reflection" in method:
+                return "复评说明：本报告经过反思修订后，复用上一轮专家评审并重新计算规则一致性评分。"
+            return ""
+
         title  = c.get("title", "MindPilot 科研报告")
         query  = c.get("query", "")
         ts_str = datetime.now().strftime("%Y年%m月%d日 %H:%M")
@@ -213,19 +222,17 @@ class ReportGenerator:
         if ev:
             _add_heading("质量评估", 1)
             score = ev.get("overall_score", "N/A")
-            _add_body(f"最终可交付评分：{score}　|　"
-                      f"准确性：{ev.get('accuracy','N/A')}　|　"
-                      f"完整性：{ev.get('completeness','N/A')}　|　"
-                      f"格式规范：{ev.get('format_quality','N/A')}")
             if "llm_expert_score" in ev or "rule_consistency_score" in ev:
                 _add_body(
+                    f"最终可交付评分：{score}　|　"
                     f"LLM 专家评审分：{ev.get('llm_expert_score', 'N/A')}　|　"
                     f"规则一致性评分：{ev.get('rule_consistency_score', score)}"
                 )
-            rule_dimension_scores = ev.get("rule_dimension_scores", {}) or {}
-            if rule_dimension_scores:
-                detail = "；".join(f"{key}: {value}" for key, value in rule_dimension_scores.items())
-                _add_body(f"规则评分维度：{detail}")
+            else:
+                _add_body(f"最终可交付评分：{score}")
+            reflection_note = _reflection_rescore_note(ev)
+            if reflection_note:
+                _add_body(reflection_note)
             review_summary = ev.get("review_summary", {}) or {}
             overall_review = review_summary.get("overall") or ev.get("feedback", "")
             if overall_review:
@@ -247,6 +254,15 @@ class ReportGenerator:
         title  = c.get("title", "MindPilot 科研报告")
         query  = c.get("query", "")
         ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _reflection_rescore_note(ev: dict) -> str:
+            breakdown = ev.get("scoring_breakdown", {}) or {}
+            method = str(breakdown.get("method", ev.get("method", "")))
+            if "targeted_llm_after_reflection" in method:
+                return "复评说明：本报告经过反思修订后，已由相关专家对被修改章节进行定向复评。"
+            if "reused_llm_after_reflection" in method:
+                return "复评说明：本报告经过反思修订后，复用上一轮专家评审并重新计算规则一致性评分。"
+            return ""
 
         lines = [
             f"# {title}",
@@ -337,17 +353,11 @@ class ReportGenerator:
                 f"| 最终可交付评分 | {score} |",
                 f"| LLM 专家评审分 | {ev.get('llm_expert_score','N/A')} |",
                 f"| 规则一致性评分 | {ev.get('rule_consistency_score', score)} |",
-                f"| 准确性   | {ev.get('accuracy','N/A')} |",
-                f"| 完整性   | {ev.get('completeness','N/A')} |",
-                f"| 格式规范 | {ev.get('format_quality','N/A')} |",
                 "",
             ]
-            rule_dimension_scores = ev.get("rule_dimension_scores", {}) or {}
-            if rule_dimension_scores:
-                lines += ["### 规则评分维度", ""]
-                lines += ["| 规则维度 | 得分 |", "|------|------|"]
-                for key, value in rule_dimension_scores.items():
-                    lines.append(f"| {key} | {value} |")
+            reflection_note = _reflection_rescore_note(ev)
+            if reflection_note:
+                lines.append(reflection_note)
                 lines.append("")
             review_summary = ev.get("review_summary", {}) or {}
             overall_review = review_summary.get("overall") or ev.get("feedback", "")
