@@ -5,7 +5,7 @@
 已升级：引入 Cross-Encoder 深度交互模型进行高精度精排 (Rerank)。
 已升级：知识图谱持久化 + 语义节点扩展 + 图增强检索。
 已升级：智能上下文解析，支持对提取的关键词进行相关性打分并选取 Top-K 防止过度约束。
-已升级：系统提示词强制抽取单词形态（防止复数精确匹配失败）。
+已升级：多路召回与融合排序（本地图谱与 ArXiv 结果合并去重，统一全局重排截断）。
 """
 
 import os
@@ -32,6 +32,17 @@ class KnowledgeEdge:
     target: str
     relation: str           # cites | uses_method | belongs_to | authored_by | has_keyword
     weight: float = 1.0
+
+
+class RecoveredPaper:
+    """【新增】鸭子类型类：用于将本地图谱的 JSON 数据瞬间还原为具有行为的 Paper 对象"""
+    def __init__(self, data_dict: dict):
+        for k, v in data_dict.items():
+            setattr(self, k, v)
+            
+    def to_dict(self) -> dict:
+        # 返回深拷贝以防止外部修改污染
+        return self.__dict__.copy()
 
 
 class LightKnowledgeGraph:
@@ -63,7 +74,8 @@ class LightKnowledgeGraph:
                 "year": paper.published[:4], 
                 "url": paper.url,
                 "relevance": paper.relevance_score,
-                "summary": paper.structured_summary 
+                "summary": paper.structured_summary,
+                "raw_data": paper.to_dict()  # 【关键修改】：把整篇论文的原始数据存入图谱，为多路召回做准备
             }
         ))
         
@@ -85,9 +97,10 @@ class LightKnowledgeGraph:
             
         return pid
 
-    def search_relevant_papers(self, query: str) -> list[str]:
+    def search_relevant_papers(self, query: str) -> list[dict]:
+        """【重点修改】：现在不仅返回匹配，还直接返回存储的 raw_data (论文完整字典)"""
         query_words = set(w.strip() for w in query.replace(',', ' ').lower().split() if w.strip())
-        relevant_pids = []
+        relevant_papers_data = []
         
         for nid, node in self.nodes.items():
             if node.node_type == "paper":
@@ -97,9 +110,12 @@ class LightKnowledgeGraph:
                     node_text += " " + " ".join(str(v).lower() for v in summary.values())
                 
                 if any(word in node_text for word in query_words):
-                    relevant_pids.append(nid)
+                    # 提取我们在 add_paper 时保存的 raw_data
+                    raw_data = node.properties.get("raw_data")
+                    if raw_data:
+                        relevant_papers_data.append(raw_data)
                     
-        return relevant_pids
+        return relevant_papers_data
 
     def save_to_disk(self):
         os.makedirs(os.path.dirname(self.storage_path), exist_ok=True)
@@ -226,11 +242,6 @@ class LiteratureAgent:
             self.reranker = "fallback"
 
     def _extract_search_keywords(self, query: str, task_description: str, max_keywords: int = 3) -> str:
-        """
-        【功能大升级】：从 query 和 task_description 中提取关键词，
-        并让 LLM 进行相关性评分 (1-10)，最后动态截取 Top-K 核心词，防止过度约束。
-        """
-        # 【重点修改】：强制使用单数名词！
         system = (
             "你是学术文献检索专家。请从用户的核心问题和任务描述中，提取可用于底层数据库（如 ArXiv）检索的核心英文学术关键词（短语）。\n"
             "严格遵守以下规则和步骤：\n"
@@ -280,52 +291,79 @@ class LiteratureAgent:
             search_keywords = self._extract_search_keywords(query, task_description, max_keywords=3)
             self.logger.info(self.AGENT_NAME, f"🎯 最终参与检索的高分核心词: {search_keywords}")
 
-            self.logger.info(self.AGENT_NAME, "正在进行图增强检索（扫描本地知识图谱）...")
-            local_pids = self.kg.search_relevant_papers(search_keywords)
-            if local_pids:
-                self.logger.info(self.AGENT_NAME, f"💡 从本地记忆中关联到 {len(local_pids)} 篇历史文献。")
+            # 【核心修改点 1】：本地图谱路召回
+            self.logger.info(self.AGENT_NAME, "正在进行图增强检索（多路召回：本地图谱）...")
+            local_papers_data = self.kg.search_relevant_papers(search_keywords)
+            local_papers = [RecoveredPaper(data) for data in local_papers_data]
+            
+            if local_papers:
+                self.logger.info(self.AGENT_NAME, f"💡 成功从本地图谱中召回 {len(local_papers)} 篇历史文献。")
 
-            self.logger.info(self.AGENT_NAME, "开始 ArXiv 混合检索获取最新前沿...")
-            papers = self.arxiv.search(
+            # 【核心修改点 2】：ArXiv API 路召回
+            self.logger.info(self.AGENT_NAME, "开始 ArXiv 混合检索获取最新前沿（多路召回：云端 API）...")
+            api_papers = self.arxiv.search(
                 search_keywords,
                 max_results=self.config.literature.arxiv_max_results
             )
 
-            if papers:
-                papers = self._rerank(papers, search_keywords)
+            # 【核心修改点 3】：融合去重（Fusion & Deduplication）
+            # 我们优先保留本地的论文对象，因为它们可能已经包含了耗时生成的 structured_summary
+            merged_papers_dict = {}
+            
+            # 先将 API 召回的结果放入池子
+            for p in api_papers:
+                merged_papers_dict[p.arxiv_id] = p
+                
+            # 再将本地找回的结果放入池子（如果有相同 arxiv_id 的，本地版会覆盖 API 版）
+            for p in local_papers:
+                merged_papers_dict[p.arxiv_id] = p
+                
+            merged_papers_list = list(merged_papers_dict.values())
+            self.logger.info(self.AGENT_NAME, f"两路召回合并去重后，总计进入候选池论文数：{len(merged_papers_list)} 篇")
 
-            self.logger.info(self.AGENT_NAME, f"为 {len(papers)} 篇论文生成摘要并构建图谱关系...")
-            for paper in papers:
+            # 【核心修改点 4】：全局融合重排序 (Global Rerank)
+            if merged_papers_list:
+                merged_papers_list = self._rerank(merged_papers_list, search_keywords)
+
+            # 【核心修改点 5】：动态截断选取真正的 Top-10 
+            # 保证不论多路召回了多少，只把质量最高的一批塞给下游
+            final_top_papers = merged_papers_list[:self.config.literature.arxiv_max_results]
+
+            self.logger.info(self.AGENT_NAME, f"为最终入选的 {len(final_top_papers)} 篇论文补全摘要并更新图谱...")
+            for paper in final_top_papers:
+                # 只对那些没有摘要（来自新 API）的论文请求 LLM
                 if not paper.structured_summary:
                     paper.structured_summary = self.summarizer.summarize(paper)
+                # 重新写入知识图谱（会更新其多跳关系和最新的检索相关性得分）
                 self.kg.add_paper(paper)
 
             self.kg.save_to_disk()
             self.logger.info(self.AGENT_NAME, "知识图谱状态已持久化。")
 
-            recall_5 = self._compute_recall_at_k(papers, k=5)
-            recall_10 = self._compute_recall_at_k(papers, k=10)
+            # 指标计算评估的也是融合后的终极列表
+            recall_5 = self._compute_recall_at_k(final_top_papers, k=5)
+            recall_10 = self._compute_recall_at_k(final_top_papers, k=10)
             
-            review = self._generate_review(original_context, papers[:5])
+            review = self._generate_review(original_context, final_top_papers[:5])
 
             self.memory.add(
-                content=f"文献检索: {query or task_description[:80]}，找到 {len(papers)} 篇",
+                content=f"文献检索: {query or task_description[:80]}，融合召回 {len(final_top_papers)} 篇",
                 agent=self.AGENT_NAME,
-                payload={"papers": [p.to_dict() for p in papers[:5]]},
+                payload={"papers": [p.to_dict() for p in final_top_papers[:5]]},
                 tags=["literature"],
             )
 
             result = {
-                "papers": [p.to_dict() for p in papers],
-                "top_papers": [p.to_dict() for p in papers[:self.config.literature.retrieval_top_k]],
+                "papers": [p.to_dict() for p in final_top_papers],
+                "top_papers": [p.to_dict() for p in final_top_papers[:self.config.literature.retrieval_top_k]],
                 "knowledge_graph": self.kg.stats(),
                 "literature_review": review,
                 "metrics": {"recall@5": recall_5, "recall@10": recall_10},
-                "total_found": len(papers),
-                "local_kg_hits": len(local_pids)
+                "total_found": len(final_top_papers),
+                "local_kg_hits": len(local_papers)  # 记录本地召回的绝对数量，用于调试和报告
             }
             self.logger.finish_call(call, result)
-            self._print_results(papers[:5])
+            self._print_results(final_top_papers[:5])
             return result
 
         except Exception as e:
@@ -337,7 +375,7 @@ class LiteratureAgent:
         if self.reranker == "fallback":
             return self._fallback_rerank(papers, query)
 
-        self.logger.info(self.AGENT_NAME, f"正在使用 Cross-Encoder 对 {len(papers)} 篇候选论文进行深度重排...")
+        self.logger.info(self.AGENT_NAME, f"正在使用 Cross-Encoder 对 {len(papers)} 篇候选论文进行全局深度重排...")
         pairs = [[query, p.title + " " + p.abstract] for p in papers]
 
         try:
@@ -347,7 +385,7 @@ class LiteratureAgent:
                 p.relevance_score = round(float(sigmoid_score), 3)
 
             sorted_papers = sorted(papers, key=lambda p: p.relevance_score, reverse=True)
-            self.logger.success(self.AGENT_NAME, "重排序完成。")
+            self.logger.success(self.AGENT_NAME, "全局重排序完成。")
             return sorted_papers
         except Exception as e:
             self.logger.warning(self.AGENT_NAME, f"Cross-Encoder 推理异常，降级回 TF-IDF: {e}")
@@ -374,23 +412,39 @@ class LiteratureAgent:
 
     def _generate_review(self, original_context: str, papers: list) -> str:
         if not papers: return "未找到相关文献。"
-        paper_summaries = "\n".join([
-            f"[{i+1}] {p.title}\n   方法：{p.structured_summary.get('method','') if p.structured_summary else ''}"
-            for i, p in enumerate(papers)
-        ])
+        
+        summary_lines = []
+        for i, p in enumerate(papers):
+            lines = [f"[{i+1}] {p.title}"]
+            if p.structured_summary:
+                method = p.structured_summary.get('method', '')
+                conclusion = p.structured_summary.get('conclusion', '')
+                limitation = p.structured_summary.get('limitation', '')
+                if method: lines.append(f"   方法：{method}")
+                if conclusion: lines.append(f"   结论：{conclusion}")
+                if limitation: lines.append(f"   局限：{limitation}")
+            else:
+                lines.append(f"   摘要：{p.abstract[:150]}...")
+            summary_lines.append("\n".join(lines))
+            
+        paper_summaries = "\n\n".join(summary_lines)
+        
         system = (
-            "你是学术写作专家。请根据以下论文列表，写一段200字左右的中文文献综述。\n"
-            "请务必关注用户的『原始任务指令』，在综述中尽量涵盖用户要求的重点（如涉及特定方法或数据集）。"
+            "你是学术写作专家。请根据以下提供的真实论文列表，写一段300字左右的中文文献综述。\n"
+            "严格遵守以下规则：\n"
+            "1. 务必关注用户的『原始任务指令』，尽量涵盖用户要求的重点。\n"
+            "2. 【防幻觉要求】：绝对禁止编造文献中未提及的方法、数据或结论。你的综述必须完全基于提供的论文信息。\n"
+            "3. 引用规范：在提及某篇论文的观点或方法时，务必使用对应的方括号编号（如 [1], [2]）进行标注。"
         )
         resp = self.llm.chat([
             {"role": "system", "content": system},
             {"role": "user", "content": f"原始任务指令与背景：{original_context}\n\n相关检索论文：\n{paper_summaries}"}
         ])
-        return resp[:600]
+        return resp[:800]
 
     def _print_results(self, papers: list):
         print(f"\n{'━'*58}")
-        print(f"  📚 文献检索结果 (Top {len(papers)})")
+        print(f"  📚 文献检索结果 (全局 Top {len(papers)})")
         print(f"{'━'*58}")
         for i, p in enumerate(papers, 1):
             authors = ", ".join(p.authors[:2]) + (" et al." if len(p.authors) > 2 else "")
