@@ -84,7 +84,7 @@ class LiteratureConfig:
 @dataclass
 class CodeConfig:
     max_debug_rounds: int = 5
-    execution_timeout: int = 30
+    execution_timeout: int = 90
     forbidden_modules: list = field(default_factory=lambda: [
         "os.system", "subprocess", "shutil.rmtree", "__import__('os').system"
     ])

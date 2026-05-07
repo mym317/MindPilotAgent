@@ -54,7 +54,6 @@ class ASTSafetyChecker(ast.NodeVisitor):
         "os.system", "os.popen", "os.execv", "os.execve",
         "subprocess.call", "subprocess.run", "subprocess.Popen",
         "shutil.rmtree", "shutil.move",
-        "open",  # 文件写操作单独检测
         "__import__", "eval", "exec", "compile",
         "socket.socket",
     }
@@ -91,11 +90,9 @@ class ASTSafetyChecker(ast.NodeVisitor):
         func_name = self._get_call_name(node.func)
         if func_name in self.FORBIDDEN_CALLS:
             self.issues.append(f"禁止调用: {func_name}()")
-        # 检测 open() 写模式
-        if func_name == "open" and len(node.args) >= 2:
-            mode_arg = node.args[1]
-            if isinstance(mode_arg, ast.Constant) and "w" in str(mode_arg.value):
-                self.issues.append("禁止文件写操作: open(..., 'w')")
+        # 允许只读 open()，禁止写入/追加/读写模式
+        if func_name == "open" and self._is_write_open_call(node):
+            self.issues.append("禁止文件写操作: open(..., 写模式)")
         self.generic_visit(node)
 
     def _get_call_name(self, node) -> str:
@@ -104,6 +101,17 @@ class ASTSafetyChecker(ast.NodeVisitor):
         if isinstance(node, ast.Attribute):
             return f"{self._get_call_name(node.value)}.{node.attr}"
         return ""
+
+    def _is_write_open_call(self, node) -> bool:
+        mode_value = None
+        if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
+            mode_value = node.args[1].value
+        for keyword in getattr(node, "keywords", []) or []:
+            if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                mode_value = keyword.value.value
+        if mode_value is None:
+            return False
+        return any(flag in str(mode_value) for flag in ("w", "a", "x", "+"))
 
     def check(self, code: str) -> list[str]:
         self.issues = []
@@ -342,11 +350,18 @@ class CodeExecutor:
         import builtins
         safe_builtins = {k: getattr(builtins, k) for k in self.SAFE_BUILTINS if hasattr(builtins, k)}
 
+        def safe_open(file, mode="r", *args, **kwargs):
+            if any(flag in str(mode or "r") for flag in ("w", "a", "x", "+")):
+                raise PermissionError("沙箱仅允许只读文件访问")
+            return builtins.open(file, mode, *args, **kwargs)
+
+        safe_builtins["open"] = safe_open
+
         # 允许安全的科学计算库
         ALLOWED_IMPORTS = {
             "numpy", "pandas", "matplotlib", "scipy", "sklearn",
             "math", "random", "json", "re", "collections",
-            "itertools", "statistics", "time", "datetime",
+            "itertools", "statistics", "time", "datetime", "csv", "pathlib",
             "sklearn.linear_model", "sklearn.metrics", "sklearn.cluster",
             "sklearn.preprocessing", "sklearn.model_selection",
             "matplotlib.pyplot", "scipy.stats",
@@ -373,7 +388,7 @@ class CodeExecutor:
             "math": "math", "random": "random",
             "json": "json", "re": "re",
             "collections": "collections", "itertools": "itertools",
-            "statistics": "statistics",
+            "statistics": "statistics", "csv": "csv", "pathlib": "pathlib",
         }
         for alias, mod_name in allowed_modules.items():
             try:

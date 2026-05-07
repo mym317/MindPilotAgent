@@ -6,8 +6,15 @@ AST 静态安全检测 + 受限沙箱执行。
 """
 
 import ast
+import csv
+import json
 import os
+import re
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 
@@ -38,20 +45,30 @@ class CodeAgent:
         self.memory = memory_store
         self.logger = logger
         self.max_rounds = config.code.max_debug_rounds
-        # debug
+        self.dataset_dir = Path(__file__).resolve().parent.parent / "dataset"
+        self.dataset_dir.mkdir(parents=True, exist_ok=True)
         self.debug_mode = os.getenv("MP_DEBUG", "0") == "1"
 
-    def run(self, task_description: str) -> dict:
+    def run(self, task_description: str, context: dict = None) -> dict:
         """
         主入口：生成并执行代码，自动调试
         """
         call = self.logger.start_call(self.AGENT_NAME, "code_generation", task_description)
         session = CodeSession(task_id=call.call_id, requirement=task_description)
+        context = context or {}
 
         try:
-            # Step 1: 初始代码生成（只基于任务描述）
+            # Step 1: 准备实验数据集，并把路径带给后续代码生成
+            self.logger.info(self.AGENT_NAME, "准备实验数据集...")
+            dataset_info = self._prepare_dataset(task_description, context, session.task_id)
+            self.logger.info(
+                self.AGENT_NAME,
+                f"数据集已保存: {dataset_info['csv_path']} | 来源: {dataset_info['source']}"
+            )
+
+            # Step 2: 初始代码生成（基于任务描述 + 本地数据集路径）
             self.logger.info(self.AGENT_NAME, "生成初始代码...")
-            code = self._generate_code(task_description)
+            code = self._generate_code(task_description, context, dataset_info)
 
             quick_issues = self._quick_validate_code(code)
             if quick_issues:
@@ -62,7 +79,7 @@ class CodeAgent:
                 code = self._regenerate_clean_code(task_description, code)
 
 
-            # Step 2: 执行 + 自动调试循环
+            # Step 3: 执行 + 自动调试循环
             for round_num in range(1, self.max_rounds + 1):
                 self.logger.info(self.AGENT_NAME, f"第 {round_num}/{self.max_rounds} 轮执行...")
 
@@ -150,6 +167,10 @@ class CodeAgent:
                 "pass_at_1": session.pass_at_1,
                 "iterations": session.iterations,
                 "test_code": test_code,
+                "dataset_path": dataset_info.get("csv_path", ""),
+                "dataset_json_path": dataset_info.get("json_path", ""),
+                "dataset_source": dataset_info.get("source", ""),
+                "dataset_rows": dataset_info.get("row_count", 0),
             }
             self.logger.finish_call(call, result)
             self._print_session(session)
@@ -159,27 +180,73 @@ class CodeAgent:
             self.logger.fail_call(call, str(e))
             raise
 
-    def _generate_code(self, requirement: str) -> str:
-        """初始代码生成（只基于任务描述）"""
-        system = ( 
-                "你是资深 Python 科研工程师。请根据需求生成高质量、可直接运行的 Python 代码。\n"
-                "要求：\n"
-                "1. 添加中文注释。\n"
-                "2. 包含完整的错误处理。\n"
-                "3. 代码必须是轻量级可运行示例，不要下载外部模型、数据集或权重文件。\n"
-                "4. 不要依赖本地不存在的数据路径。\n"
-                "5. 如果任务涉及 YOLO、Transformer、CLIP 等大型模型，请用合成数据或简化模型模拟核心优化思想。\n"
-                "6. 最后必须 print 可供后续分析的关键数值结果，例如 loss、accuracy、latency、model_size、speedup 等。\n"
-                "7. 建议按如下格式打印：\n"
-                "print('ANALYSIS_RESULT_START')\n"
-                "print('accuracy=0.91')\n"
-                "print('loss=0.12')\n"
-                "print('latency_ms=12.5')\n"
-                "print('ANALYSIS_RESULT_END')\n"
-                "8. 只输出纯 Python 代码，不要 markdown，不要解释。"
-            
+    def _generate_code(self, requirement: str, context: dict = None, dataset_info: dict = None) -> str:
+        """初始代码生成（基于任务描述 + 简要上下文）"""
+        context = context or {}
+
+        context_parts = []
+
+        # 1. 文献方法摘要，只取少量，避免 prompt 太长
+        top_papers = context.get("top_papers", [])
+        if top_papers:
+            methods = []
+            for p in top_papers[:2]:
+                summary = p.get("structured_summary", {}) if isinstance(p, dict) else {}
+                method = summary.get("method", "")
+                if method:
+                    methods.append(method[:300])
+            if methods:
+                context_parts.append("参考文献方法摘要：\n" + "\n".join(f"- {m}" for m in methods))
+
+        # 2. 实验设计摘要
+        exp_design = context.get("exp_design", {})
+        if isinstance(exp_design, dict) and exp_design:
+            hypothesis = exp_design.get("research_hypothesis", "")
+            full_desc = exp_design.get("full_description", "")
+            if hypothesis:
+                context_parts.append(f"实验假设：{hypothesis[:300]}")
+            if full_desc:
+                context_parts.append(f"实验设计说明：{full_desc[:500]}")
+
+        # 3. baseline 和 metrics
+        baselines = context.get("baselines", [])
+        if baselines:
+            context_parts.append(
+                "实验对照/基线：\n" + "\n".join(f"- {str(b)[:150]}" for b in baselines[:3])
+            )
+
+        metrics = context.get("metrics", [])
+        if metrics:
+            context_parts.append(
+                "评价指标：\n" + "\n".join(f"- {str(m)[:120]}" for m in metrics[:5])
+            )
+
+        context_text = "\n\n".join(context_parts)
+
+        system = (
+            "你是资深 Python 科研工程师。请根据任务描述和给定上下文生成高质量、可直接运行的 Python 代码。\n"
+            "要求：\n"
+            "1. 任务描述是主要依据，上下文只作为参考，不要输出文献综述或解释文字。\n"
+            "2. 添加中文注释。\n"
+            "3. 包含完整的错误处理。\n"
+            "4. 代码必须是轻量级可运行示例，不要下载外部模型、数据集或权重文件。\n"
+            "5. 不要依赖本地不存在的数据路径。\n"
+            "6. 如果任务涉及 YOLO、Transformer、CLIP 等大型模型，请用合成数据或简化模型模拟核心优化思想。\n"
+            "7. 最后必须 print 可供后续分析的关键数值结果，例如 loss、accuracy、latency、model_size、speedup 等。\n"
+            "8. 建议按如下格式打印：\n"
+            "print('ANALYSIS_RESULT_START')\n"
+            "print('accuracy=0.91')\n"
+            "print('loss=0.12')\n"
+            "print('latency_ms=12.5')\n"
+            "print('ANALYSIS_RESULT_END')\n"
+            "9. 只输出纯 Python 代码，不要 markdown，不要解释。"
         )
-        prompt = f"需求：{requirement}"
+
+        if context_text:
+            prompt = f"任务描述：{requirement}\n\n参考上下文：\n{context_text}"
+        else:
+            prompt = f"任务描述：{requirement}"
+        prompt = f"{prompt}{self._format_dataset_hint(dataset_info)}"
         resp = self.llm.chat_code([
             {"role": "system", "content": system},
             {"role": "user", "content": prompt}
@@ -191,6 +258,323 @@ class CodeAgent:
         self._save_debug_file("generate_extracted.py", extracted)
 
         return extracted
+
+    def _prepare_dataset(self, requirement: str, context: dict, task_id: str) -> dict:
+        """优先使用真实公开数据，失败后让 LLM 生成本地 CSV/JSON 数据集。"""
+        task_dir = self.dataset_dir / self._safe_slug(task_id)
+        task_dir.mkdir(parents=True, exist_ok=True)
+
+        dataset_spec = self._try_get_real_dataset(requirement, context)
+        if dataset_spec:
+            self.logger.info(
+                self.AGENT_NAME,
+                f"数据集来源: {dataset_spec.get('source')} ({dataset_spec.get('dataset_name')})"
+            )
+        else:
+            self.logger.info(self.AGENT_NAME, "数据集来源: llm_generated")
+            dataset_spec = self._generate_dataset_with_llm(requirement, context)
+
+        if not dataset_spec:
+            self.logger.info(self.AGENT_NAME, "数据集来源: local_fallback")
+            dataset_spec = self._build_fallback_dataset(requirement)
+
+        dataset_name = self._safe_slug(str(dataset_spec.get("dataset_name") or "mindpilot_dataset"))
+        dataset_spec["dataset_name"] = dataset_name
+        dataset_spec["generated_at"] = datetime.now(timezone.utc).isoformat()
+        dataset_spec["requirement"] = requirement
+        dataset_spec.setdefault("source", "unknown")
+
+        rows = dataset_spec.get("rows") if isinstance(dataset_spec.get("rows"), list) else []
+        if not rows:
+            dataset_spec = self._build_fallback_dataset(requirement)
+            dataset_name = dataset_spec["dataset_name"]
+            rows = dataset_spec["rows"]
+
+        json_path = task_dir / f"{dataset_name}.json"
+        csv_path = task_dir / f"{dataset_name}.csv"
+        self._write_dataset_files(dataset_spec, json_path, csv_path)
+
+        column_names = self._dataset_columns(dataset_spec, rows)
+        return {
+            "dataset_name": dataset_name,
+            "json_path": str(json_path),
+            "csv_path": str(csv_path),
+            "row_count": len(rows),
+            "column_names": column_names,
+            "summary": dataset_spec.get("description", ""),
+            "preview": rows[:3],
+            "source": dataset_spec.get("source", "unknown"),
+            "source_url": dataset_spec.get("source_url", ""),
+        }
+
+    def _try_get_real_dataset(self, requirement: str, context: dict) -> dict:
+        query_text = self._dataset_query_text(requirement, context)
+        for dataset in self._ranked_public_datasets(query_text):
+            try:
+                rows = self._download_csv_rows(dataset["url"])
+            except (OSError, TimeoutError, UnicodeError, urllib.error.URLError, csv.Error) as exc:
+                self.logger.warning(self.AGENT_NAME, f"真实数据集下载失败({dataset['name']}): {exc}")
+                continue
+            if rows:
+                return {
+                    "dataset_name": dataset["name"],
+                    "description": dataset["description"],
+                    "columns": self._infer_columns(rows),
+                    "rows": rows,
+                    "source": "downloaded_public_dataset",
+                    "source_url": dataset["url"],
+                }
+
+        builtin = self._load_builtin_dataset(query_text)
+        if builtin:
+            return builtin
+        return {}
+
+    def _generate_dataset_with_llm(self, requirement: str, context: dict) -> dict:
+        dataset_desc = ""
+        exp_design = context.get("exp_design") if isinstance(context, dict) else {}
+        if isinstance(exp_design, dict):
+            dataset_desc = exp_design.get("dataset", "")
+
+        system = (
+            "你是科研实验数据集生成器。请根据需求生成一个可直接保存为 CSV 和 JSON 的本地数据集。\n"
+            "要求：\n"
+            "1. 只输出严格 JSON，不要 Markdown，不要解释。\n"
+            "2. JSON 需要包含 dataset_name、description、columns、rows。\n"
+            "3. rows 中每一项都应是扁平键值对，至少包含 12 条样本。\n"
+            "4. 数据必须自包含，不要依赖网络或外部下载。"
+        )
+        prompt = f"需求：{requirement}"
+        if dataset_desc:
+            prompt += f"\n实验设计中的数据集要求：{dataset_desc}"
+        prompt += "\n请生成与上述需求直接相关的本地表格数据集。"
+
+        try:
+            resp = self.llm.chat([
+                {"role": "system", "content": system},
+                {"role": "user", "content": prompt},
+            ])
+        except Exception as exc:
+            self.logger.warning(self.AGENT_NAME, f"LLM 数据集生成失败: {exc}")
+            return {}
+
+        data = self._parse_dataset_spec(resp)
+        if data:
+            data["source"] = "llm_generated"
+        return data
+
+    def _format_dataset_hint(self, dataset_info: dict) -> str:
+        if not dataset_info:
+            return ""
+        preview = json.dumps(dataset_info.get("preview", []), ensure_ascii=False)
+        return (
+            "\n\n本地实验数据集已经准备完成，请优先读取该数据集，而不是假设外部输入或重新下载数据：\n"
+            f"- 数据集名称：{dataset_info.get('dataset_name', '')}\n"
+            f"- CSV 路径：{dataset_info.get('csv_path', '')}\n"
+            f"- JSON 路径：{dataset_info.get('json_path', '')}\n"
+            f"- 来源：{dataset_info.get('source', '')}\n"
+            f"- 列名：{', '.join(dataset_info.get('column_names', []))}\n"
+            f"- 样本数：{dataset_info.get('row_count', 0)}\n"
+            f"- 数据摘要：{dataset_info.get('summary', '')}\n"
+            f"- 样例：{preview}\n"
+        )
+
+    def _dataset_query_text(self, requirement: str, context: dict) -> str:
+        parts = [requirement]
+        exp_design = context.get("exp_design") if isinstance(context, dict) else {}
+        if isinstance(exp_design, dict):
+            parts.append(exp_design.get("dataset", ""))
+        for paper in (context.get("top_papers", []) if isinstance(context, dict) else [])[:3]:
+            if isinstance(paper, dict):
+                parts.append(str(paper.get("title", "")))
+        return " ".join(part for part in parts if part).lower()
+
+    def _ranked_public_datasets(self, query_text: str) -> list[dict]:
+        catalog = [
+            {
+                "name": "iris_public_dataset",
+                "url": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/iris.csv",
+                "description": "Iris 鸢尾花分类公开数据集。",
+                "keywords": ["iris", "flower", "鸢尾", "分类", "classification", "species"],
+            },
+            {
+                "name": "titanic_public_dataset",
+                "url": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/titanic.csv",
+                "description": "Titanic 乘客生存分析公开数据集。",
+                "keywords": ["titanic", "survival", "泰坦尼克", "生存", "分类"],
+            },
+            {
+                "name": "tips_public_dataset",
+                "url": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/tips.csv",
+                "description": "餐厅消费与小费公开数据集。",
+                "keywords": ["tips", "restaurant", "bill", "小费", "餐厅", "回归"],
+            },
+            {
+                "name": "mpg_public_dataset",
+                "url": "https://raw.githubusercontent.com/mwaskom/seaborn-data/master/mpg.csv",
+                "description": "汽车燃油效率公开数据集。",
+                "keywords": ["mpg", "car", "fuel", "汽车", "油耗", "回归"],
+            },
+        ]
+        scored = []
+        for dataset in catalog:
+            score = sum(1 for key in dataset["keywords"] if key.lower() in query_text)
+            if score:
+                scored.append((score, dataset))
+        scored.sort(key=lambda item: item[0], reverse=True)
+        return [dataset for _, dataset in scored[:2]]
+
+    def _download_csv_rows(self, url: str, max_rows: int = 200) -> list[dict]:
+        req = urllib.request.Request(url, headers={"User-Agent": "MindPilotAgent/1.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            text = resp.read(2_000_000).decode("utf-8-sig")
+        rows = []
+        for row in csv.DictReader(text.splitlines()):
+            clean = {str(k).strip(): self._coerce_cell(v) for k, v in row.items() if k}
+            if any(value != "" for value in clean.values()):
+                rows.append(clean)
+            if len(rows) >= max_rows:
+                break
+        return rows
+
+    def _load_builtin_dataset(self, query_text: str) -> dict:
+        try:
+            from sklearn import datasets as sklearn_datasets
+        except Exception:
+            return {}
+
+        builtin = [
+            ("iris_sklearn_dataset", "load_iris", "Iris 鸢尾花分类真实数据集。", ["iris", "鸢尾", "classification", "分类"]),
+            ("wine_sklearn_dataset", "load_wine", "Wine 葡萄酒分类真实数据集。", ["wine", "葡萄酒", "classification", "分类"]),
+            ("diabetes_sklearn_dataset", "load_diabetes", "Diabetes 糖尿病回归真实数据集。", ["diabetes", "糖尿病", "regression", "回归"]),
+        ]
+        for name, loader_name, desc, keywords in builtin:
+            if not any(key.lower() in query_text for key in keywords):
+                continue
+            data = getattr(sklearn_datasets, loader_name)()
+            rows = self._sklearn_rows(data)
+            if rows:
+                return {
+                    "dataset_name": name,
+                    "description": desc,
+                    "columns": self._infer_columns(rows),
+                    "rows": rows,
+                    "source": "builtin_public_dataset",
+                    "source_url": f"sklearn.datasets.{loader_name}",
+                }
+        return {}
+
+    def _sklearn_rows(self, data, max_rows: int = 200) -> list[dict]:
+        raw_feature_names = getattr(data, "feature_names", None)
+        feature_names = list(raw_feature_names) if raw_feature_names is not None else []
+        raw_target_names = getattr(data, "target_names", None)
+        target_names = list(raw_target_names) if raw_target_names is not None else []
+        values = getattr(data, "data", None)
+        if values is None:
+            return []
+        rows = []
+        for idx, vector in enumerate(values[:max_rows]):
+            row = {}
+            for col_idx, value in enumerate(vector):
+                name = feature_names[col_idx] if col_idx < len(feature_names) else f"feature_{col_idx + 1}"
+                row[self._safe_slug(str(name))] = self._python_scalar(value)
+            target = getattr(data, "target", None)
+            if target is not None:
+                target_value = self._python_scalar(target[idx])
+                row["target"] = target_value
+                if isinstance(target_value, int) and 0 <= target_value < len(target_names):
+                    row["target_name"] = str(target_names[target_value])
+            rows.append(row)
+        return rows
+
+    def _parse_dataset_spec(self, text: str) -> dict:
+        if not text:
+            return {}
+        cleaned = self.executor.extract_code(text)
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        raw = match.group(0) if match else cleaned
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        rows = data.get("rows") or data.get("records") or []
+        data["rows"] = rows if isinstance(rows, list) else []
+        return data
+
+    def _build_fallback_dataset(self, requirement: str) -> dict:
+        topic = requirement.strip()[:40] or "mindpilot"
+        rows = []
+        for idx in range(1, 13):
+            rows.append({
+                "sample_id": idx,
+                "task_text": f"{topic} - 样本 {idx}",
+                "feature_a": round(idx * 1.25, 3),
+                "feature_b": round((idx % 5) * 2.5 + 0.5, 3),
+                "label": "train" if idx <= 8 else "test",
+            })
+        return {
+            "dataset_name": "mindpilot_fallback_dataset",
+            "description": f"用于任务「{topic}」的本地回退数据集。",
+            "columns": self._infer_columns(rows),
+            "rows": rows,
+            "source": "local_fallback",
+        }
+
+    def _write_dataset_files(self, dataset_spec: dict, json_path: Path, csv_path: Path):
+        with json_path.open("w", encoding="utf-8") as f:
+            json.dump(dataset_spec, f, ensure_ascii=False, indent=2)
+
+        rows = dataset_spec.get("rows", [])
+        fieldnames = self._dataset_columns(dataset_spec, rows)
+        with csv_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({name: self._csv_value(row.get(name)) for name in fieldnames})
+
+    def _dataset_columns(self, dataset_spec: dict, rows: list[dict]) -> list[str]:
+        columns = dataset_spec.get("columns") or []
+        names = [col.get("name", "") if isinstance(col, dict) else str(col) for col in columns]
+        names = [name for name in names if name]
+        for row in rows:
+            if isinstance(row, dict):
+                for key in row.keys():
+                    if key not in names:
+                        names.append(key)
+        return names
+
+    def _infer_columns(self, rows: list[dict]) -> list[dict]:
+        return [{"name": name, "type": "str", "description": f"数据字段 {name}"} for name in self._dataset_columns({}, rows)]
+
+    def _coerce_cell(self, value):
+        text = "" if value is None else str(value).strip()
+        if text == "":
+            return ""
+        try:
+            if re.fullmatch(r"[-+]?\d+", text):
+                return int(text)
+            if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)(?:[eE][-+]?\d+)?", text):
+                return float(text)
+        except ValueError:
+            return text
+        return text
+
+    def _csv_value(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, (str, int, float, bool)):
+            return value
+        return json.dumps(value, ensure_ascii=False)
+
+    def _python_scalar(self, value):
+        return value.item() if hasattr(value, "item") else value
+
+    @staticmethod
+    def _safe_slug(text: str) -> str:
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "_", text.strip()).strip("._-")
+        return slug[:80] or "mindpilot_dataset"
 
     def _debug_code(self, code: str, error: str, error_type: str, requirement: str) -> str:
         """根据错误信息自动修复代码"""

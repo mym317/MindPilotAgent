@@ -43,11 +43,11 @@ from agents.evaluation_agent import EvaluationAgent
 # 每个 Step 的独立超时（秒），超时后使用降级结果继续流程
 _STEP_TIMEOUTS = {
     "planning":    300,   # Step 1：规划，含多次 LLM 调用，给足时间
-    "literature":  240,   # Step 2：文献检索
-    "experiment":  180,   # Step 3：实验设计（在文献检索完成后执行）
-    "code":        300,   # Step 4：代码生成+调试
-    "analysis":    180,   # Step 5：数据分析
-    "evaluation":  480,   # Step 6：评估+报告生成
+    "literature":  1024,   # Step 2：文献检索
+    "experiment":  1024,   # Step 3：实验设计（在文献检索完成后执行）
+    "code":        1024,   # Step 4：代码生成+调试
+    "analysis":    240,   # Step 5：数据分析
+    "evaluation":  1024,   # Step 6：评估+报告生成
 }
 
 
@@ -287,7 +287,7 @@ class MindPilotOrchestrator:
         }
         code_result = self._run_step(
             "code",
-            lambda: self.code_agent.run(code_desc),
+            lambda: self.code_agent.run(code_desc, context=context),
             code_fallback,
         )
 
@@ -302,7 +302,7 @@ class MindPilotOrchestrator:
                 self.logger.info("Orchestrator", "User requested code retry")
                 code_result = self._run_step(
                     "code",
-                    lambda: self.code_agent.run(code_desc),
+                    lambda: self.code_agent.run(code_desc, context=context),
                     code_fallback,
                 )
             if review["action"] == "skip":
@@ -388,7 +388,7 @@ class MindPilotOrchestrator:
             "report_files": eval_result.get("report_files", {}),
             "total_time_s": total_time,
             "session_log":  str(self.logger.log_file),
-            "message_bus":  bus_stats,
+            # "message_bus":  bus_stats,
         }
         self._print_final_summary(final_result, total_time)
         return final_result
